@@ -1,1 +1,53 @@
+name: Loyverse Export → Save to Repo
 
+on:
+  schedule:
+    - cron: "0 2 * * *"  # 09:00 ICT (UTC+7)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run exporter
+        run: node export.js > out/log.txt 2>&1
+        env:
+          LOYVERSE_EMAIL: ${{ secrets.LOYVERSE_EMAIL }}
+          LOYVERSE_PASSWORD: ${{ secrets.LOYVERSE_PASSWORD }}
+          LOYVERSE_STORAGE_B64: ${{ secrets.LOYVERSE_STORAGE_B64 }}
+
+      - name: Upload logs & screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug
+          path: |
+            out/log.txt
+            out/*.png
+          if-no-files-found: ignore
+
+      - name: Commit CSV to repo
+        run: |
+          mkdir -p data
+          cp out/inventory.csv data/latest.csv
+          ts=$(date -u +%Y-%m-%d_%H-%M-%S)
+          cp out/inventory.csv data/loyverse_inventory_$ts.csv
+          git config user.name "github-actions"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/latest.csv data/loyverse_inventory_*.csv
+          git commit -m "update: inventory CSV [skip ci]" || echo "no changes"
+          git push
