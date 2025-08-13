@@ -1,0 +1,10 @@
+{
+  "name": "loyverse-export-to-repo",
+  "private": true,
+  "dependencies": {
+    "playwright": "^1.46.0"
+  },
+  "scripts": {
+    "postinstall": "npx playwright install --with-deps && npx playwright install-deps"
+  }
+}
