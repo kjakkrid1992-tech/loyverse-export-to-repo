@@ -23,12 +23,12 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Run exporter
-        run: node export.js > out/log.txt 2>&1
-        env:
-          LOYVERSE_EMAIL: ${{ secrets.LOYVERSE_EMAIL }}
-          LOYVERSE_PASSWORD: ${{ secrets.LOYVERSE_PASSWORD }}
-          LOYVERSE_STORAGE_B64: ${{ secrets.LOYVERSE_STORAGE_B64 }}
+- name: Run exporter
+  run: |
+    mkdir -p out                    # ✅ สร้างโฟลเดอร์ก่อน export
+    node export.js > out/log.txt 2>&1
+  env:
+    LOYVERSE_STORAGE_B64: ${{ secrets.LOYVERSE_STORAGE_B64 }}
 
       - name: Upload logs & screenshot
         if: always()
