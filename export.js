@@ -1,5 +1,4 @@
-\
-// export.js (v8) — ultimate fallback: capture Blob/objectURL downloads
+// export.js (v8-fix) — ultimate fallback: capture Blob/objectURL downloads
 const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
@@ -140,10 +139,8 @@ async function saveFrom(download, popup, response) {
 }
 
 async function tryGrabBlobHref(page) {
-  // read captured hrefs/blobs from init script
   const info = await page.evaluate(async () => {
     const entry = { hrefs: (window.__dl && window.__dl.hrefs) || [], blobCount: window.__dl ? Object.keys(window.__dl.blobs).length : 0, last: null };
-    // If there is any blob captured, convert the last one to text
     if (window.__dl && Object.keys(window.__dl.blobs).length) {
       const urls = Object.keys(window.__dl.blobs);
       const lastUrl = urls[urls.length - 1];
@@ -157,7 +154,6 @@ async function tryGrabBlobHref(page) {
     fs.writeFileSync(path.join(OUTDIR, CSV_FILENAME), info.last.text, 'utf8');
     return true;
   }
-  // As a fallback, if we observed a data: or blob: href, try fetch within page to extract
   if (info.hrefs && info.hrefs.length) {
     const href = info.hrefs[info.hrefs.length - 1];
     const content = await page.evaluate(async (h) => {
@@ -166,7 +162,6 @@ async function tryGrabBlobHref(page) {
           const b64 = h.split(',')[1];
           return Buffer.from(b64, 'base64').toString('utf-8');
         }
-        // blob: — fetch from page context
         const res = await fetch(h);
         const txt = await res.text();
         return txt;
@@ -186,7 +181,6 @@ async function clickAndCollect(page, clickFn) {
   await clickFn();
   await page.screenshot({ path: path.join(OUTDIR, AFTER), fullPage: true }).catch(() => {});
   if (await saveFrom(await waiters.downloadP, await waiters.popupP, await waiters.responseP)) return true;
-  // Try DOM-based capture for blob/objectURL
   return await tryGrabBlobHref(page);
 }
 
@@ -199,7 +193,6 @@ async function navigateAndExport(page) {
     await dismissOverlays(page);
     await page.evaluate(() => window.scrollTo(0, 0));
 
-    // A) direct candidates
     for (const t of exportTargets(page)) {
       if (await t.count()) {
         log('click candidate');
@@ -208,7 +201,6 @@ async function navigateAndExport(page) {
       }
     }
 
-    // B) toolbar heuristic near "+ เพิ่มสินค้า"
     const addBtn = page.getByText(/^\+\s*เพิ่มสินค้า$/).first();
     if (await addBtn.count()) {
       log('toolbar heuristic');
@@ -226,7 +218,6 @@ async function navigateAndExport(page) {
       if (ok) return true;
     }
 
-    // C) overflow menus
     const menus = [
       'button:has-text("เพิ่มเติม")',
       'button:has-text("More")',
