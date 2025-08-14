@@ -1,5 +1,5 @@
 
-// export.js (v2) — robust Export detection + multi-page fallback
+// export.js (v3) — wider language coverage + anchor scan + more pages
 const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
@@ -12,7 +12,10 @@ const URLS_TO_TRY = [
   'https://r.loyverse.com/dashboard/#/goods/price',           // รายการราคา
   'https://r.loyverse.com/dashboard/#/goods/items',           // สินค้า
   'https://r.loyverse.com/dashboard/#/inventory_by_items',    // สต็อกตามสินค้า
+  'https://r.loyverse.com/dashboard/#/inventory',             // การปรับสต็อก (บางบัญชีมี export)
 ];
+
+const EXPORT_TEXTS = /Export|ส่งออก|นำออก|Download|ดาวน์โหลด|CSV/i;
 
 function ensureOutDir() {
   if (!fs.existsSync(OUTDIR)) fs.mkdirSync(OUTDIR, { recursive: true });
@@ -38,7 +41,6 @@ async function newContextWithStorage(browser) {
       console.error('[storage] out/storage.json parse error:', e.message);
     }
   }
-  // Fallback: email/password (may fail with captcha/2FA)
   const email = process.env.LOYVERSE_EMAIL;
   const password = process.env.LOYVERSE_PASSWORD;
   if (email && password) {
@@ -55,7 +57,6 @@ async function newContextWithStorage(browser) {
     ].join(', ')).first();
     await loginBtn.click();
     await page.waitForLoadState('networkidle', { timeout: 90000 });
-    // Touch a backoffice url so cookies for r.loyverse.com are set
     await page.goto(URLS_TO_TRY[0], { waitUntil: 'domcontentloaded' });
     await page.waitForLoadState('networkidle', { timeout: 60000 });
     try {
@@ -69,7 +70,6 @@ async function newContextWithStorage(browser) {
 }
 
 async function dismissOverlays(page) {
-  // Close cookie banners / dialogs if any
   const buttons = [
     'button:has-text("Accept")',
     'button:has-text("I agree")',
@@ -84,25 +84,51 @@ async function dismissOverlays(page) {
       try { await b.click({ timeout: 1000 }); } catch {}
     }
   }
-  // Press Escape to close any open popovers
   try { await page.keyboard.press('Escape'); } catch {}
 }
 
+async function clickCandidate(page, loc) {
+  if (await loc.count()) {
+    try { await loc.first().click(); return true; } catch {}
+  }
+  return false;
+}
+
 async function tryClickExport(page) {
-  // 1) Direct button by role/name
-  const byRole = page.getByRole('button', { name: /Export|ส่งออก|Download|ดาวน์โหลด/i }).first();
-  if (await byRole.count()) {
-    await byRole.click();
-    return true;
+  // 1) Role-based
+  const roleCandidates = [
+    page.getByRole('button', { name: EXPORT_TEXTS }),
+    page.getByRole('link', { name: EXPORT_TEXTS }),
+    page.getByRole('menuitem', { name: EXPORT_TEXTS }),
+  ];
+  for (const loc of roleCandidates) {
+    if (await clickCandidate(page, loc)) return true;
   }
 
-  // 2) Any element containing text -> click it
-  const byText = page.getByText(/Export|ส่งออก|Download|ดาวน์โหลด/i).first();
-  if (await byText.count()) {
-    try { await byText.click(); return true; } catch {}
-  }
+  // 2) Text-based search on any element
+  if (await clickCandidate(page, page.getByText(EXPORT_TEXTS))) return true;
 
-  // 3) Common kebab/overflow menus, then select Export
+  // 3) aria-label and title attributes
+  const attrSelectors = [
+    '[aria-label*="Export" i]','[title*="Export" i]',
+    '[aria-label*="ส่งออก"]','[title*="ส่งออก"]',
+    '[aria-label*="นำออก"]','[title*="นำออก"]',
+    '[aria-label*="Download" i]','[title*="Download" i]',
+    '[aria-label*="ดาวน์โหลด"]','[title*="ดาวน์โหลด"]',
+    '[aria-label*="CSV" i]','[title*="CSV" i]',
+  ].join(', ');
+  if (await clickCandidate(page, page.locator(attrSelectors))) return true;
+
+  // 4) Anchor patterns
+  const anchor = page.locator([
+    'a[download]',
+    'a[href*="export"]',
+    'a[href*="download"]',
+    'a:has-text("CSV")',
+  ].join(', '));
+  if (await clickCandidate(page, anchor)) return true;
+
+  // 5) Known overflow menus then click item
   const menus = [
     'button[aria-label*="More" i]',
     'button:has([data-icon="more"])',
@@ -116,12 +142,11 @@ async function tryClickExport(page) {
     const menuBtn = page.locator(m).first();
     if (await menuBtn.count()) {
       await menuBtn.click();
-      const menuItem = page.getByText(/Export|ส่งออก|Download|ดาวน์โหลด/i).first();
+      const menuItem = page.getByText(EXPORT_TEXTS).first();
       if (await menuItem.count()) {
         await menuItem.click();
         return true;
       }
-      // close menu
       try { await page.keyboard.press('Escape'); } catch {}
     }
   }
@@ -138,6 +163,7 @@ async function confirmExportIfDialog(page) {
     'button:has-text("ตกลง")',
     'button:has-text("ยืนยัน")',
     'button:has-text("ดาวน์โหลด")',
+    'button:has-text("CSV")',
   ].join(', '));
   if (await confirmBtns.count()) {
     await confirmBtns.first().click();
@@ -148,17 +174,14 @@ async function navigateAndExport(page) {
   for (const url of URLS_TO_TRY) {
     await page.goto(url, { waitUntil: 'domcontentloaded' });
     await page.waitForLoadState('networkidle', { timeout: 60000 });
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(1800);
     await dismissOverlays(page);
-
-    // Scroll up to ensure header buttons are visible
-    await page.evaluate(() => { window.scrollTo(0, 0); });
+    await page.evaluate(() => window.scrollTo(0, 0));
 
     const ok = await tryClickExport(page);
     if (ok) {
       await confirmExportIfDialog(page);
-      // Wait for download
-      const download = await page.context().waitForEvent('download', { timeout: 60000 });
+      const download = await page.context().waitForEvent('download', { timeout: 90000 });
       await download.saveAs(path.join(OUTDIR, CSV_FILENAME));
       return true;
     }
@@ -187,7 +210,7 @@ async function navigateAndExport(page) {
     console.error('[error]', err.message);
     try {
       const p = await context.newPage();
-      await p.goto('https://r.loyverse.com/dashboard/#/goods/price', { waitUntil: 'domcontentloaded' }).catch(() => {});
+      await p.goto('https://r.loyverse.com/dashboard/#/goods/items', { waitUntil: 'domcontentloaded' }).catch(() => {});
       await p.screenshot({ path: path.join(OUTDIR, SCREENSHOT), fullPage: true }).catch(() => {});
       await p.close();
       console.error('[error] saved screenshot to out/error.png');
