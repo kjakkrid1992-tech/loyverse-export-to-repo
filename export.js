@@ -1,5 +1,5 @@
 
-// export.js (v3) — wider language coverage + anchor scan + more pages
+// export.js (v4) — extra-robust Export click for Thai UI
 const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
@@ -9,13 +9,11 @@ const CSV_FILENAME = 'inventory.csv';
 const SCREENSHOT = 'error.png';
 
 const URLS_TO_TRY = [
-  'https://r.loyverse.com/dashboard/#/goods/price',           // รายการราคา
-  'https://r.loyverse.com/dashboard/#/goods/items',           // สินค้า
-  'https://r.loyverse.com/dashboard/#/inventory_by_items',    // สต็อกตามสินค้า
-  'https://r.loyverse.com/dashboard/#/inventory',             // การปรับสต็อก (บางบัญชีมี export)
+  'https://r.loyverse.com/dashboard/#/goods/price?page=0&limit=10&inventory=all',
+  'https://r.loyverse.com/dashboard/#/goods/items',
+  'https://r.loyverse.com/dashboard/#/inventory_by_items',
+  'https://r.loyverse.com/dashboard/#/inventory',
 ];
-
-const EXPORT_TEXTS = /Export|ส่งออก|นำออก|Download|ดาวน์โหลด|CSV/i;
 
 function ensureOutDir() {
   if (!fs.existsSync(OUTDIR)) fs.mkdirSync(OUTDIR, { recursive: true });
@@ -50,11 +48,9 @@ async function newContextWithStorage(browser) {
     await page.waitForSelector('input[type="email"], input[name="email"]', { timeout: 60000 });
     await page.fill('input[type="email"], input[name="email"]', email);
     await page.fill('input[type="password"], input[name="password"]', password);
-    const loginBtn = page.locator([
-      'button:has-text("Sign in")',
-      'button:has-text("เข้าสู่ระบบ")',
-      'button[type="submit"]',
-    ].join(', ')).first();
+    const loginBtn = page.locator(
+      'button:has-text("Sign in"), button:has-text("เข้าสู่ระบบ"), button[type="submit"]'
+    ).first();
     await loginBtn.click();
     await page.waitForLoadState('networkidle', { timeout: 90000 });
     await page.goto(URLS_TO_TRY[0], { waitUntil: 'domcontentloaded' });
@@ -70,103 +66,134 @@ async function newContextWithStorage(browser) {
 }
 
 async function dismissOverlays(page) {
-  const buttons = [
+  // Close common overlays/cookie banners
+  const selectors = [
     'button:has-text("Accept")',
     'button:has-text("I agree")',
     'button:has-text("ตกลง")',
     'button:has-text("ยอมรับ")',
-    'button:has-text("ปิด")',
     'button[aria-label*="Close" i]',
+    '.cdk-overlay-backdrop' // click backdrop to close menus
   ];
-  for (const sel of buttons) {
-    const b = page.locator(sel).first();
-    if (await b.count()) {
-      try { await b.click({ timeout: 1000 }); } catch {}
+  for (const s of selectors) {
+    const el = page.locator(s).first();
+    if (await el.count()) {
+      try { await el.click({ timeout: 500 }); } catch {}
     }
   }
   try { await page.keyboard.press('Escape'); } catch {}
 }
 
-async function clickCandidate(page, loc) {
-  if (await loc.count()) {
-    try { await loc.first().click(); return true; } catch {}
-  }
-  return false;
-}
+async function clickExportSmart(page) {
+  // 0) make sure toolbar is visible
+  await page.evaluate(() => window.scrollTo(0, 0));
 
-async function tryClickExport(page) {
-  // 1) Role-based
-  const roleCandidates = [
-    page.getByRole('button', { name: EXPORT_TEXTS }),
-    page.getByRole('link', { name: EXPORT_TEXTS }),
-    page.getByRole('menuitem', { name: EXPORT_TEXTS }),
+  // 1) direct role/button/link by name
+  const names = /^(Export|ส่งออก|Download|ดาวน์โหลด|นำออก|CSV)$/i;
+  const roleTargets = [
+    page.getByRole('button', { name: names }).first(),
+    page.getByRole('link',   { name: names }).first(),
+    page.locator('[role="button"]').filter({ hasText: names }).first(),
   ];
-  for (const loc of roleCandidates) {
-    if (await clickCandidate(page, loc)) return true;
+  for (const t of roleTargets) {
+    if (await t.count()) {
+      try { await t.click(); return true; } catch {}
+    }
   }
 
-  // 2) Text-based search on any element
-  if (await clickCandidate(page, page.getByText(EXPORT_TEXTS))) return true;
+  // 2) generic elements containing the text
+  const textTargets = [
+    page.getByText(names, { exact: false }).first(),
+    page.locator('text=ส่งออก').first(),
+    page.locator('text=Export').first(),
+    page.locator('text=ดาวน์โหลด').first(),
+  ];
+  for (const t of textTargets) {
+    if (await t.count()) {
+      try { await t.click(); return true; } catch {}
+      // click closest clickable ancestor
+      try {
+        const h = await t.elementHandle();
+        if (h) {
+          await page.evaluate((el) => {
+            const clickable = el.closest('button, a, [role="button"], .mat-button, .mat-stroked-button, .btn, .mdc-button');
+            (clickable || el).dispatchEvent(new MouseEvent('click', { bubbles: true }));
+          }, h);
+          return true;
+        }
+      } catch {}
+    }
+  }
 
-  // 3) aria-label and title attributes
-  const attrSelectors = [
-    '[aria-label*="Export" i]','[title*="Export" i]',
-    '[aria-label*="ส่งออก"]','[title*="ส่งออก"]',
-    '[aria-label*="นำออก"]','[title*="นำออก"]',
-    '[aria-label*="Download" i]','[title*="Download" i]',
-    '[aria-label*="ดาวน์โหลด"]','[title*="ดาวน์โหลด"]',
-    '[aria-label*="CSV" i]','[title*="CSV" i]',
-  ].join(', ');
-  if (await clickCandidate(page, page.locator(attrSelectors))) return true;
-
-  // 4) Anchor patterns
-  const anchor = page.locator([
-    'a[download]',
-    'a[href*="export"]',
-    'a[href*="download"]',
-    'a:has-text("CSV")',
-  ].join(', '));
-  if (await clickCandidate(page, anchor)) return true;
-
-  // 5) Known overflow menus then click item
+  // 3) overflow menus "เพิ่มเติม/More/Actions" then menu item Export
   const menus = [
-    'button[aria-label*="More" i]',
-    'button:has([data-icon="more"])',
-    '[data-testid="kebab-menu"]',
-    'button:has-text("More")',
     'button:has-text("เพิ่มเติม")',
+    'button:has-text("More")',
     'button:has-text("Actions")',
-    'button:has-text("การดำเนินการ")',
+    'button[aria-label*="More" i]',
+    '[data-testid="kebab-menu"]',
+    'button:has([data-icon="more"])',
   ];
   for (const m of menus) {
-    const menuBtn = page.locator(m).first();
-    if (await menuBtn.count()) {
-      await menuBtn.click();
-      const menuItem = page.getByText(EXPORT_TEXTS).first();
-      if (await menuItem.count()) {
-        await menuItem.click();
-        return true;
+    const btn = page.locator(m).first();
+    if (await btn.count()) {
+      try { await btn.click(); } catch {}
+      const item = page.getByText(names).first();
+      if (await item.count()) {
+        try { await item.click(); return true; } catch {}
       }
       try { await page.keyboard.press('Escape'); } catch {}
     }
   }
 
+  // 4) toolbar heuristic: find the container with "+ เพิ่มสินค้า / นำเข้า / ส่งออก"
+  const addBtn = page.getByText(/^\+\s*เพิ่มสินค้า$/);
+  if (await addBtn.count()) {
+    try {
+      const h = await addBtn.first().elementHandle();
+      if (h) {
+        await page.evaluate((el) => {
+          const toolbar = el.closest('header, .toolbar, .mat-toolbar, .mdc-toolbar, .head, .panel, .top') || document.body;
+          const candidates = toolbar.querySelectorAll('button, a, [role="button"]');
+          for (const c of candidates) {
+            const text = (c.innerText || c.textContent || '').trim();
+            if (/^ส่งออก$|^Export$|ดาวน์โหลด|Download/i.test(text)) {
+              c.click();
+              return;
+            }
+          }
+        }, h);
+        // small wait to detect if dialog opened
+        await page.waitForTimeout(400);
+        return true;
+      }
+    } catch {}
+  }
+
+  // 5) scan <a> with download attribute or href contains 'export'/'download'
+  const found = await page.evaluate(() => {
+    const as = Array.from(document.querySelectorAll('a, button, [role="button"]'));
+    for (const a of as) {
+      const text = (a.innerText || a.textContent || '').trim();
+      const href = (a.getAttribute && a.getAttribute('href')) || '';
+      if (/^ส่งออก$|^Export$|ดาวน์โหลด|Download/i.test(text)) { a.click(); return true; }
+      if (a.hasAttribute && a.hasAttribute('download')) { a.click(); return true; }
+      if (/export|download|csv/i.test(href)) { a.click(); return true; }
+    }
+    return false;
+  });
+  if (found) return true;
+
   return false;
 }
 
 async function confirmExportIfDialog(page) {
-  const hasDialog = await page.locator('[role="dialog"], .modal, .cdk-overlay-container [role="dialog"]').first().count();
-  if (!hasDialog) return;
-  const confirmBtns = page.locator([
-    'button:has-text("Export")',
-    'button:has-text("Download")',
-    'button:has-text("ตกลง")',
-    'button:has-text("ยืนยัน")',
-    'button:has-text("ดาวน์โหลด")',
-    'button:has-text("CSV")',
-  ].join(', '));
-  if (await confirmBtns.count()) {
-    await confirmBtns.first().click();
+  const dlg = page.locator('[role="dialog"], .modal, .cdk-overlay-container [role="dialog"]').first();
+  if (await dlg.count()) {
+    const ok = page.locator(
+      'button:has-text("Export"), button:has-text("Download"), button:has-text("ตกลง"), button:has-text("ยืนยัน"), button:has-text("ดาวน์โหลด")'
+    ).first();
+    if (await ok.count()) { try { await ok.click(); } catch {} }
   }
 }
 
@@ -174,14 +201,13 @@ async function navigateAndExport(page) {
   for (const url of URLS_TO_TRY) {
     await page.goto(url, { waitUntil: 'domcontentloaded' });
     await page.waitForLoadState('networkidle', { timeout: 60000 });
-    await page.waitForTimeout(1800);
+    await page.waitForTimeout(1200);
     await dismissOverlays(page);
-    await page.evaluate(() => window.scrollTo(0, 0));
 
-    const ok = await tryClickExport(page);
-    if (ok) {
+    const clicked = await clickExportSmart(page);
+    if (clicked) {
       await confirmExportIfDialog(page);
-      const download = await page.context().waitForEvent('download', { timeout: 90000 });
+      const download = await page.context().waitForEvent('download', { timeout: 60000 });
       await download.saveAs(path.join(OUTDIR, CSV_FILENAME));
       return true;
     }
@@ -204,15 +230,15 @@ async function navigateAndExport(page) {
   try {
     const page = await context.newPage();
     const ok = await navigateAndExport(page);
-    if (!ok) throw new Error('ไม่พบเมนู/ปุ่ม Export บนทุกหน้าที่ลอง');
+    if (!ok) throw new Error('ไม่พบปุ่ม/เมนู "ส่งออก" บนหน้าที่รองรับ');
     console.log('[ok] Downloaded:', path.join(OUTDIR, CSV_FILENAME));
   } catch (err) {
     console.error('[error]', err.message);
     try {
-      const p = await context.newPage();
-      await p.goto('https://r.loyverse.com/dashboard/#/goods/items', { waitUntil: 'domcontentloaded' }).catch(() => {});
-      await p.screenshot({ path: path.join(OUTDIR, SCREENSHOT), fullPage: true }).catch(() => {});
-      await p.close();
+      const pg = await context.newPage();
+      await pg.goto('https://r.loyverse.com/dashboard/#/goods/price?page=0&limit=10&inventory=all', { waitUntil: 'domcontentloaded' }).catch(() => {});
+      await pg.screenshot({ path: path.join(OUTDIR, SCREENSHOT), fullPage: true }).catch(() => {});
+      await pg.close();
       console.error('[error] saved screenshot to out/error.png');
     } catch {}
     process.exit(1);
