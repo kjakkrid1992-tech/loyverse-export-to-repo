@@ -1,5 +1,5 @@
 
-// export.js (v4) — extra-robust Export click for Thai UI
+// export.js (v5) — fix race: waitForEvent('download') with Promise.all + popup fallback
 const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
@@ -66,14 +66,13 @@ async function newContextWithStorage(browser) {
 }
 
 async function dismissOverlays(page) {
-  // Close common overlays/cookie banners
   const selectors = [
     'button:has-text("Accept")',
     'button:has-text("I agree")',
     'button:has-text("ตกลง")',
     'button:has-text("ยอมรับ")',
     'button[aria-label*="Close" i]',
-    '.cdk-overlay-backdrop' // click backdrop to close menus
+    '.cdk-overlay-backdrop'
   ];
   for (const s of selectors) {
     const el = page.locator(s).first();
@@ -84,48 +83,20 @@ async function dismissOverlays(page) {
   try { await page.keyboard.press('Escape'); } catch {}
 }
 
-async function clickExportSmart(page) {
-  // 0) make sure toolbar is visible
-  await page.evaluate(() => window.scrollTo(0, 0));
-
-  // 1) direct role/button/link by name
+function candidatesForExport(page) {
   const names = /^(Export|ส่งออก|Download|ดาวน์โหลด|นำออก|CSV)$/i;
-  const roleTargets = [
+  return [
     page.getByRole('button', { name: names }).first(),
     page.getByRole('link',   { name: names }).first(),
     page.locator('[role="button"]').filter({ hasText: names }).first(),
-  ];
-  for (const t of roleTargets) {
-    if (await t.count()) {
-      try { await t.click(); return true; } catch {}
-    }
-  }
-
-  // 2) generic elements containing the text
-  const textTargets = [
     page.getByText(names, { exact: false }).first(),
     page.locator('text=ส่งออก').first(),
     page.locator('text=Export').first(),
     page.locator('text=ดาวน์โหลด').first(),
   ];
-  for (const t of textTargets) {
-    if (await t.count()) {
-      try { await t.click(); return true; } catch {}
-      // click closest clickable ancestor
-      try {
-        const h = await t.elementHandle();
-        if (h) {
-          await page.evaluate((el) => {
-            const clickable = el.closest('button, a, [role="button"], .mat-button, .mat-stroked-button, .btn, .mdc-button');
-            (clickable || el).dispatchEvent(new MouseEvent('click', { bubbles: true }));
-          }, h);
-          return true;
-        }
-      } catch {}
-    }
-  }
+}
 
-  // 3) overflow menus "เพิ่มเติม/More/Actions" then menu item Export
+async function openExportMenuIfAny(page) {
   const menus = [
     'button:has-text("เพิ่มเติม")',
     'button:has-text("More")',
@@ -137,64 +108,79 @@ async function clickExportSmart(page) {
   for (const m of menus) {
     const btn = page.locator(m).first();
     if (await btn.count()) {
-      try { await btn.click(); } catch {}
-      const item = page.getByText(names).first();
-      if (await item.count()) {
-        try { await item.click(); return true; } catch {}
-      }
+      try { await btn.click(); await page.waitForTimeout(150); } catch {}
+      const item = page.getByText(/Export|ส่งออก|Download|ดาวน์โหลด|นำออก/i).first();
+      if (await item.count()) return item;
       try { await page.keyboard.press('Escape'); } catch {}
     }
   }
+  return null;
+}
 
-  // 4) toolbar heuristic: find the container with "+ เพิ่มสินค้า / นำเข้า / ส่งออก"
-  const addBtn = page.getByText(/^\+\s*เพิ่มสินค้า$/);
-  if (await addBtn.count()) {
+async function clickExportAndWait(page) {
+  await page.evaluate(() => window.scrollTo(0, 0));
+
+  // Case A: clickable candidates directly trigger download
+  for (const t of candidatesForExport(page)) {
+    if (await t.count()) {
+      try {
+        const [download] = await Promise.all([
+          page.context().waitForEvent('download', { timeout: 15000 }),
+          t.click()
+        ]);
+        return download;
+      } catch {}
+    }
+  }
+
+  // Case B: open menu then click export item
+  const menuItem = await openExportMenuIfAny(page);
+  if (menuItem && await menuItem.count()) {
     try {
-      const h = await addBtn.first().elementHandle();
-      if (h) {
-        await page.evaluate((el) => {
-          const toolbar = el.closest('header, .toolbar, .mat-toolbar, .mdc-toolbar, .head, .panel, .top') || document.body;
-          const candidates = toolbar.querySelectorAll('button, a, [role="button"]');
-          for (const c of candidates) {
-            const text = (c.innerText || c.textContent || '').trim();
-            if (/^ส่งออก$|^Export$|ดาวน์โหลด|Download/i.test(text)) {
-              c.click();
-              return;
-            }
-          }
-        }, h);
-        // small wait to detect if dialog opened
-        await page.waitForTimeout(400);
-        return true;
-      }
+      const [download] = await Promise.all([
+        page.context().waitForEvent('download', { timeout: 15000 }),
+        menuItem.click()
+      ]);
+      return download;
     } catch {}
   }
 
-  // 5) scan <a> with download attribute or href contains 'export'/'download'
-  const found = await page.evaluate(() => {
-    const as = Array.from(document.querySelectorAll('a, button, [role="button"]'));
-    for (const a of as) {
-      const text = (a.innerText || a.textContent || '').trim();
-      const href = (a.getAttribute && a.getAttribute('href')) || '';
-      if (/^ส่งออก$|^Export$|ดาวน์โหลด|Download/i.test(text)) { a.click(); return true; }
-      if (a.hasAttribute && a.hasAttribute('download')) { a.click(); return true; }
-      if (/export|download|csv/i.test(href)) { a.click(); return true; }
-    }
-    return false;
-  });
-  if (found) return true;
-
-  return false;
-}
-
-async function confirmExportIfDialog(page) {
-  const dlg = page.locator('[role="dialog"], .modal, .cdk-overlay-container [role="dialog"]').first();
-  if (await dlg.count()) {
-    const ok = page.locator(
+  // Case C: dialog appears (format/options) -> click confirm while listening for download
+  const dialogSel = '[role="dialog"], .modal, .cdk-overlay-container [role="dialog"]';
+  if (await page.locator(dialogSel).first().count()) {
+    const confirm = page.locator(
       'button:has-text("Export"), button:has-text("Download"), button:has-text("ตกลง"), button:has-text("ยืนยัน"), button:has-text("ดาวน์โหลด")'
     ).first();
-    if (await ok.count()) { try { await ok.click(); } catch {} }
+    if (await confirm.count()) {
+      try {
+        const [download] = await Promise.all([
+          page.context().waitForEvent('download', { timeout: 15000 }),
+          confirm.click()
+        ]);
+        return download;
+      } catch {}
+    }
   }
+
+  // Case D: some UIs open a new tab (popup) with CSV
+  try {
+    const [popup] = await Promise.all([
+      page.waitForEvent('popup', { timeout: 5000 }),
+      // as a last click attempt: try text again (might focus link)
+      (async () => { for (const t of candidatesForExport(page)) { if (await t.count()) { try { await t.click(); break; } catch {} } } })()
+    ]);
+    await popup.waitForLoadState('domcontentloaded', { timeout: 10000 });
+    const res = await popup.waitForResponse(resp => /text\/csv|application\/octet-stream/i.test(resp.headers()['content-type'] || ''), { timeout: 10000 }).catch(() => null);
+    if (res) {
+      const body = await res.body();
+      const saveTo = path.join(OUTDIR, CSV_FILENAME);
+      fs.writeFileSync(saveTo, body);
+      await popup.close().catch(() => {});
+      return { saveAs: async (p) => fs.copyFileSync(saveTo, p) };
+    }
+  } catch {}
+
+  return null;
 }
 
 async function navigateAndExport(page) {
@@ -204,11 +190,9 @@ async function navigateAndExport(page) {
     await page.waitForTimeout(1200);
     await dismissOverlays(page);
 
-    const clicked = await clickExportSmart(page);
-    if (clicked) {
-      await confirmExportIfDialog(page);
-      const download = await page.context().waitForEvent('download', { timeout: 60000 });
-      await download.saveAs(path.join(OUTDIR, CSV_FILENAME));
+    const dl = await clickExportAndWait(page);
+    if (dl) {
+      await dl.saveAs(path.join(OUTDIR, CSV_FILENAME));
       return true;
     }
   }
@@ -230,7 +214,7 @@ async function navigateAndExport(page) {
   try {
     const page = await context.newPage();
     const ok = await navigateAndExport(page);
-    if (!ok) throw new Error('ไม่พบปุ่ม/เมนู "ส่งออก" บนหน้าที่รองรับ');
+    if (!ok) throw new Error('ยังไม่พบการดาวน์โหลดหลังคลิก "ส่งออก" — อาจต้องระบุหน้า/สิทธิ์การใช้งาน');
     console.log('[ok] Downloaded:', path.join(OUTDIR, CSV_FILENAME));
   } catch (err) {
     console.error('[error]', err.message);
