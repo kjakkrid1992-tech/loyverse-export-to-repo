@@ -2,7 +2,7 @@ name: Loyverse Export → Save to Repo
 
 on:
   schedule:
-    - cron: "0 2 * * *"  # ทุกวันเวลา 09:00 (UTC+7)
+    - cron: "0 2 * * *"  # รันทุกวันเวลา 09:00 (UTC+7)
   workflow_dispatch:
 
 permissions:
@@ -11,16 +11,27 @@ permissions:
 jobs:
   export:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: npm
+          # ไม่ใส่ cache: npm เพราะ repo ยังไม่มี lockfile
 
-      - name: Install dependencies
-        run: npm install playwright
+      - name: Init package.json (if missing)
+        run: |
+          if [ ! -f package.json ]; then
+            npm init -y
+          fi
+
+      - name: Install Playwright + Chromium (with OS deps)
+        run: |
+          npm install playwright
+          npx playwright install --with-deps chromium
 
       - name: Run exporter
         run: |
@@ -31,7 +42,7 @@ jobs:
           LOYVERSE_EMAIL: ${{ secrets.LOYVERSE_EMAIL }}
           LOYVERSE_PASSWORD: ${{ secrets.LOYVERSE_PASSWORD }}
 
-      - name: Upload debug logs
+      - name: Upload debug logs & screenshots
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -41,7 +52,7 @@ jobs:
             out/*.png
           if-no-files-found: ignore
 
-      - name: Commit CSV
+      - name: Commit CSV to repo
         if: success()
         run: |
           mkdir -p data
