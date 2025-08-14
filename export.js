@@ -1,5 +1,5 @@
 
-// export.js (v5) — fix race: waitForEvent('download') with Promise.all + popup fallback
+// export.js (v6) — robust "ส่งออก" automation with download/popup/response fallbacks
 const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
@@ -83,8 +83,12 @@ async function dismissOverlays(page) {
   try { await page.keyboard.press('Escape'); } catch {}
 }
 
-function candidatesForExport(page) {
-  const names = /^(Export|ส่งออก|Download|ดาวน์โหลด|นำออก|CSV)$/i;
+function textCandidates() {
+  return /Export|ส่งออก|Download|ดาวน์โหลด|นำออก|CSV|Excel|ไฟล์/i;
+}
+
+function exportCandidates(page) {
+  const names = textCandidates();
   return [
     page.getByRole('button', { name: names }).first(),
     page.getByRole('link',   { name: names }).first(),
@@ -96,7 +100,7 @@ function candidatesForExport(page) {
   ];
 }
 
-async function openExportMenuIfAny(page) {
+async function openOverflowMenu(page) {
   const menus = [
     'button:has-text("เพิ่มเติม")',
     'button:has-text("More")',
@@ -108,8 +112,9 @@ async function openExportMenuIfAny(page) {
   for (const m of menus) {
     const btn = page.locator(m).first();
     if (await btn.count()) {
-      try { await btn.click(); await page.waitForTimeout(150); } catch {}
-      const item = page.getByText(/Export|ส่งออก|Download|ดาวน์โหลด|นำออก/i).first();
+      try { await btn.click(); await page.waitForTimeout(200); } catch {}
+      // return the element inside menu that matches export terms if visible
+      const item = page.getByText(textCandidates()).first();
       if (await item.count()) return item;
       try { await page.keyboard.press('Escape'); } catch {}
     }
@@ -117,70 +122,78 @@ async function openExportMenuIfAny(page) {
   return null;
 }
 
-async function clickExportAndWait(page) {
-  await page.evaluate(() => window.scrollTo(0, 0));
+async function waitForFileLike(page) {
+  // Prepare listeners BEFORE clicking
+  const downloadP = page.context().waitForEvent('download', { timeout: 20000 }).catch(() => null);
+  const popupP    = page.waitForEvent('popup', { timeout: 20000 }).catch(() => null);
+  const responseP = page.waitForResponse(resp => {
+    const ct = (resp.headers()['content-type'] || '').toLowerCase();
+    const url = resp.url();
+    return /text\/csv|application\/octet-stream/.test(ct) || /export|download|csv/i.test(url);
+  }, { timeout: 20000 }).catch(() => null);
+  return { downloadP, popupP, responseP };
+}
 
-  // Case A: clickable candidates directly trigger download
-  for (const t of candidatesForExport(page)) {
-    if (await t.count()) {
-      try {
-        const [download] = await Promise.all([
-          page.context().waitForEvent('download', { timeout: 15000 }),
-          t.click()
-        ]);
-        return download;
-      } catch {}
-    }
+async function saveFromAny(download, popup, response) {
+  if (download) {
+    await download.saveAs(path.join(OUTDIR, CSV_FILENAME));
+    return true;
   }
-
-  // Case B: open menu then click export item
-  const menuItem = await openExportMenuIfAny(page);
-  if (menuItem && await menuItem.count()) {
+  if (popup) {
     try {
-      const [download] = await Promise.all([
-        page.context().waitForEvent('download', { timeout: 15000 }),
-        menuItem.click()
-      ]);
-      return download;
+      await popup.waitForLoadState('domcontentloaded', { timeout: 10000 });
+      const resp = await popup.waitForResponse(r => {
+        const ct = (r.headers()['content-type'] || '').toLowerCase();
+        return /text\/csv|application\/octet-stream/.test(ct);
+      }, { timeout: 10000 }).catch(() => null);
+      if (resp) {
+        const body = await resp.body();
+        fs.writeFileSync(path.join(OUTDIR, CSV_FILENAME), body);
+        await popup.close().catch(() => {});
+        return true;
+      }
     } catch {}
   }
+  if (response) {
+    try {
+      const body = await response.body();
+      fs.writeFileSync(path.join(OUTDIR, CSV_FILENAME), body);
+      return true;
+    } catch {}
+  }
+  return false;
+}
 
-  // Case C: dialog appears (format/options) -> click confirm while listening for download
-  const dialogSel = '[role="dialog"], .modal, .cdk-overlay-container [role="dialog"]';
-  if (await page.locator(dialogSel).first().count()) {
+async function clickWithFileWait(page, clickFn) {
+  const { downloadP, popupP, responseP } = await waitForFileLike(page);
+  await clickFn();
+  const saved = await saveFromAny(await downloadP, await popupP, await responseP);
+  return saved;
+}
+
+async function maybeHandleExportDialog(page) {
+  const dlg = page.locator('[role="dialog"], .modal, .cdk-overlay-container [role="dialog"]').first();
+  if (await dlg.count()) {
+    // common confirm buttons
     const confirm = page.locator(
-      'button:has-text("Export"), button:has-text("Download"), button:has-text("ตกลง"), button:has-text("ยืนยัน"), button:has-text("ดาวน์โหลด")'
+      'button:has-text("Export"), button:has-text("Download"), button:has-text("ตกลง"), button:has-text("ยืนยัน"), button:has-text("ดาวน์โหลด"), button:has-text("ส่งออก")'
     ).first();
     if (await confirm.count()) {
-      try {
-        const [download] = await Promise.all([
-          page.context().waitForEvent('download', { timeout: 15000 }),
-          confirm.click()
-        ]);
-        return download;
-      } catch {}
+      const saved = await clickWithFileWait(page, async () => { await confirm.click(); });
+      if (saved) return true;
+    }
+    // sometimes dialog shows options list first
+    const options = page.getByText(/CSV|Excel|All|ทั้งหมด|รายการทั้งหมด|สินค้าทั้งหมด/i).first();
+    if (await options.count()) {
+      try { await options.click(); } catch {}
+      const confirm2 = page.getByText(/Export|ส่งออก|Download|ดาวน์โหลด|ตกลง|ยืนยัน/i).first();
+      if (await confirm2.count()) {
+        const saved2 = await clickWithFileWait(page, async () => { await confirm2.click(); });
+        if (saved2) return true;
+      }
     }
   }
-
-  // Case D: some UIs open a new tab (popup) with CSV
-  try {
-    const [popup] = await Promise.all([
-      page.waitForEvent('popup', { timeout: 5000 }),
-      // as a last click attempt: try text again (might focus link)
-      (async () => { for (const t of candidatesForExport(page)) { if (await t.count()) { try { await t.click(); break; } catch {} } } })()
-    ]);
-    await popup.waitForLoadState('domcontentloaded', { timeout: 10000 });
-    const res = await popup.waitForResponse(resp => /text\/csv|application\/octet-stream/i.test(resp.headers()['content-type'] || ''), { timeout: 10000 }).catch(() => null);
-    if (res) {
-      const body = await res.body();
-      const saveTo = path.join(OUTDIR, CSV_FILENAME);
-      fs.writeFileSync(saveTo, body);
-      await popup.close().catch(() => {});
-      return { saveAs: async (p) => fs.copyFileSync(saveTo, p) };
-    }
-  } catch {}
-
-  return null;
+  return false;
 }
 
 async function navigateAndExport(page) {
@@ -189,11 +202,58 @@ async function navigateAndExport(page) {
     await page.waitForLoadState('networkidle', { timeout: 60000 });
     await page.waitForTimeout(1200);
     await dismissOverlays(page);
+    await page.evaluate(() => window.scrollTo(0, 0));
 
-    const dl = await clickExportAndWait(page);
-    if (dl) {
-      await dl.saveAs(path.join(OUTDIR, CSV_FILENAME));
-      return true;
+    // A) try direct buttons/links
+    for (const t of exportCandidates(page)) {
+      if (await t.count()) {
+        const saved = await clickWithFileWait(page, async () => { await t.click(); });
+        if (saved) return true;
+
+        // if menu opened after click, choose item then confirm
+        const menuItem = page.getByText(textCandidates()).first();
+        if (await menuItem.count()) {
+          const saved2 = await clickWithFileWait(page, async () => { await menuItem.click(); });
+          if (saved2) return true;
+          const ok = await maybeHandleExportDialog(page);
+          if (ok) return true;
+        }
+        // or dialog path
+        const ok2 = await maybeHandleExportDialog(page);
+        if (ok2) return true;
+      }
+    }
+
+    // B) try overflow menus
+    const item = await openOverflowMenu(page);
+    if (item && await item.count()) {
+      const saved = await clickWithFileWait(page, async () => { await item.click(); });
+      if (saved) return true;
+      const ok = await maybeHandleExportDialog(page);
+      if (ok) return true;
+    }
+
+    // C) heuristics: scan toolbar near "+ เพิ่มสินค้า"
+    const addBtn = page.getByText(/^\+\s*เพิ่มสินค้า$/).first();
+    if (await addBtn.count()) {
+      try {
+        const h = await addBtn.elementHandle();
+        if (h) {
+          const saved = await clickWithFileWait(page, async () => {
+            await page.evaluate((el) => {
+              const toolbar = el.closest('header, .toolbar, .mat-toolbar, .mdc-toolbar, .head, .panel, .top') || document.body;
+              const candidates = toolbar.querySelectorAll('button, a, [role="button"]');
+              for (const c of candidates) {
+                const text = (c.innerText || c.textContent || '').trim();
+                if (/^ส่งออก$|^Export$|ดาวน์โหลด|Download/i.test(text)) { c.click(); return; }
+              }
+            }, h);
+          });
+          if (saved) return true;
+          const ok = await maybeHandleExportDialog(page);
+          if (ok) return true;
+        }
+      } catch {}
     }
   }
   return false;
@@ -214,7 +274,7 @@ async function navigateAndExport(page) {
   try {
     const page = await context.newPage();
     const ok = await navigateAndExport(page);
-    if (!ok) throw new Error('ยังไม่พบการดาวน์โหลดหลังคลิก "ส่งออก" — อาจต้องระบุหน้า/สิทธิ์การใช้งาน');
+    if (!ok) throw new Error('ยังไม่พบการดาวน์โหลดหลังคลิก "ส่งออก" — ตรวจสิทธิ์บัญชี/หน้าที่รองรับ และลองอีกครั้ง');
     console.log('[ok] Downloaded:', path.join(OUTDIR, CSV_FILENAME));
   } catch (err) {
     console.error('[error]', err.message);
