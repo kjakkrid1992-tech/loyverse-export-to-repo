@@ -22,7 +22,6 @@ jobs:
         with:
           node-version: 20
 
-      # ให้แน่ใจว่ามี package.json+lockfile และตรึง playwright เพื่อ cache ทำงาน
       - name: Ensure package.json & lockfile
         run: |
           if [ ! -f package.json ]; then
@@ -31,7 +30,6 @@ jobs:
           npm pkg set dependencies.playwright=^1.45.2
           npm i --package-lock-only
 
-      # Cache เบราว์เซอร์ของ Playwright เพื่อให้รอบต่อไปเร็ว
       - name: Cache Playwright browsers
         uses: actions/cache@v4
         with:
@@ -50,7 +48,7 @@ jobs:
       - name: Run exporter (Items first)
         env:
           LOYVERSE_STORAGE_B64: ${{ secrets.LOYVERSE_STORAGE_B64 }}
-          # บังคับให้เริ่มที่หน้า Items (ต้องใส่เครื่องหมายคำพูดเพราะมี # ใน URL)
+          # ต้องใส่เครื่องหมายคำพูดเพราะ URL มี # (ไม่งั้น YAML จะคิดว่าเป็นคอมเมนต์)
           LOYVERSE_EXPORT_PAGES: "https://r.loyverse.com/dashboard/#/goods/items"
         run: |
           mkdir -p out
