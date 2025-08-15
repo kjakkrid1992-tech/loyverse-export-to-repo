@@ -1,4 +1,4 @@
-// export.js (v12) — Items-first + click CSV option + CSV validation + deep capture
+// export.js (v13) — Items-first + strong toolbar wait/sweep + click-by-text-anywhere + CSV choice + CSV validation
 const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
@@ -36,44 +36,24 @@ function looksLikeCSV(txt){
 
 async function makeContext(browser, storageState){
   const ctx = await browser.newContext({ storageState, acceptDownloads: true });
+  // capture client-side download mechanisms
   await ctx.addInitScript(() => {
     try {
       window.__dl = { blobs:{}, hrefs:[], opens:[], locs:[] };
-
       const origCreate = URL.createObjectURL;
-      URL.createObjectURL = function(blob){
-        const u = origCreate.call(URL, blob);
-        try { window.__dl.blobs[u] = blob; } catch {}
-        return u;
-      };
-
+      URL.createObjectURL = function(blob){ const u = origCreate.call(URL, blob); try { window.__dl.blobs[u] = blob; } catch{} return u; };
       const origClick = HTMLAnchorElement.prototype.click;
-      HTMLAnchorElement.prototype.click = function(){
-        try { window.__dl.hrefs.push(this.href || ''); } catch {}
-        return origClick.call(this);
-      };
-
+      HTMLAnchorElement.prototype.click = function(){ try { window.__dl.hrefs.push(this.href || ''); } catch{}; return origClick.call(this); };
       const origSetAttr = Element.prototype.setAttribute;
-      Element.prototype.setAttribute = function(k,v){
-        try { if (this.tagName === 'A' && k.toLowerCase()==='href') window.__dl.hrefs.push(String(v||'')); } catch {}
-        return origSetAttr.call(this, k, v);
-      };
-
+      Element.prototype.setAttribute = function(k,v){ try { if (this.tagName==='A' && k.toLowerCase()==='href') window.__dl.hrefs.push(String(v||'')); } catch{}; return origSetAttr.call(this,k,v); };
       const origOpen = window.open;
-      window.open = function(u, ...rest){
-        try { window.__dl.opens.push(String(u||'')); } catch {}
-        return origOpen ? origOpen.call(window, u, ...rest) : null;
-      };
-
+      window.open = function(u,...r){ try { window.__dl.opens.push(String(u||'')); } catch{}; return origOpen ? origOpen.call(window,u,...r) : null; };
       const origAssign = window.location.assign;
-      window.location.assign = function(u){
-        try { window.__dl.locs.push(String(u||'')); } catch {}
-        return origAssign.call(window.location, u);
-      };
+      window.location.assign = function(u){ try { window.__dl.locs.push(String(u||'')); } catch{}; return origAssign.call(window.location,u); };
       const hrefDesc = Object.getOwnPropertyDescriptor(Location.prototype, 'href');
       if (hrefDesc && hrefDesc.set){
         Object.defineProperty(window.location, 'href', {
-          set(u){ try { window.__dl.locs.push(String(u||'')); } catch {}; return hrefDesc.set.call(window.location, u); },
+          set(u){ try { window.__dl.locs.push(String(u||'')); } catch{}; return hrefDesc.set.call(window.location,u); },
           get(){ return hrefDesc.get.call(window.location); }
         });
       }
@@ -116,6 +96,29 @@ async function dismissOverlays(page){
   try { await page.keyboard.press('Escape'); } catch {}
 }
 
+async function waitToolbar(page){
+  const deadline = Date.now() + 20000; // 20s
+  const probes = [
+    'button:has-text("ส่งออก")',
+    'button:has-text("นำเข้า")',
+    'button:has-text("เพิ่มเติม")',
+    'button[aria-haspopup="menu"]',
+    '[role="button"]:has-text("ส่งออก")',
+    'text=/^\\+\\s*เพิ่มสินค้า$/',
+  ];
+  while (Date.now() < deadline){
+    for (const p of probes){
+      try {
+        const loc = p.startsWith('text=') ? page.getByText(/^\+\s*เพิ่มสินค้า$/).first()
+                                          : page.locator(p).first();
+        if (await loc.count()) return true;
+      } catch {}
+    }
+    await page.waitForTimeout(300);
+  }
+  return false;
+}
+
 async function waiters(page){
   const downloadP = page.context().waitForEvent('download', { timeout: DL_TIMEOUT }).catch(() => null);
   const popupP    = page.waitForEvent('popup', { timeout: 5000 }).catch(() => null);
@@ -130,43 +133,26 @@ async function waiters(page){
 
 async function saveFrom(download, popup, response){
   const dst = path.join(OUTDIR, CSV_FILENAME);
-  if (download){
-    await download.saveAs(dst);
-    const txt = fs.readFileSync(dst, 'utf8');
-    if (looksLikeCSV(txt)) return true;
-    fs.unlinkSync(dst); // ทิ้งถ้าไม่ใช่ CSV
-  }
+  if (download){ await download.saveAs(dst); const txt = fs.readFileSync(dst,'utf8'); if (looksLikeCSV(txt)) return true; fs.unlinkSync(dst); }
   if (popup){
     try {
-      await popup.waitForLoadState('domcontentloaded', { timeout: 8000 });
+      await popup.waitForLoadState('domcontentloaded',{timeout:8000});
       const resp = await popup.waitForResponse(r => {
-        const ct = (r.headers()['content-type'] || '').toLowerCase();
-        const cd = (r.headers()['content-disposition'] || '').toLowerCase();
+        const ct=(r.headers()['content-type']||'').toLowerCase();
+        const cd=(r.headers()['content-disposition']||'').toLowerCase();
         return /text\/csv|application\/octet-stream|excel|spreadsheet/.test(ct) || /attachment/.test(cd);
-      }, { timeout: 8000 }).catch(() => null);
-      if (resp){
-        const body = await resp.body();
-        fs.writeFileSync(dst, body);
-        const txt = fs.readFileSync(dst, 'utf8');
-        if (looksLikeCSV(txt)) return true;
-        fs.unlinkSync(dst);
-      }
+      },{timeout:8000}).catch(()=>null);
+      if (resp){ const body=await resp.body(); fs.writeFileSync(dst,body); const txt=fs.readFileSync(dst,'utf8'); if (looksLikeCSV(txt)) return true; fs.unlinkSync(dst); }
     } catch {}
   }
   if (response){
-    try {
-      const body = await response.body();
-      fs.writeFileSync(dst, body);
-      const txt = fs.readFileSync(dst, 'utf8');
-      if (looksLikeCSV(txt)) return true;
-      fs.unlinkSync(dst);
-    } catch {}
+    try { const body=await response.body(); fs.writeFileSync(dst,body); const txt=fs.readFileSync(dst,'utf8'); if (looksLikeCSV(txt)) return true; fs.unlinkSync(dst); } catch {}
   }
   return false;
 }
 
 async function tryDumpClientSide(page){
-  const end = Date.now() + 10000;
+  const end = Date.now() + 12000;
   while (Date.now() < end){
     const got = await page.evaluate(async () => {
       const out = { ok:false, csv:null, info:null };
@@ -175,7 +161,7 @@ async function tryDumpClientSide(page){
           if (!u) return null;
           if (u.startsWith('data:')){
             const i = u.indexOf(',');
-            if (i > -1){ try { return atob(u.slice(i+1)); } catch { return null; } }
+            if (i>-1){ try { return atob(u.slice(i+1)); } catch { return null; } }
           }
           const res = await fetch(u);
           return await res.text();
@@ -184,7 +170,7 @@ async function tryDumpClientSide(page){
         const blobUrls = Object.keys(e.blobs || {});
         if (blobUrls.length){
           const last = blobUrls[blobUrls.length-1];
-          const txt = await e.blobs[last].text().catch(() => null);
+          const txt = await e.blobs[last].text().catch(()=>null);
           if (txt){ return { ok:true, csv:txt, info:{via:'blob', url:last} }; }
         }
         const cand = [].concat(e.hrefs||[], e.opens||[], e.locs||[]).reverse();
@@ -206,44 +192,40 @@ async function tryDumpClientSide(page){
 }
 
 async function clickCsvChoice(page){
-  // คลิกตัวเลือก CSV/Excel ในเมนู/โมดัล ถ้ามี
-  const candidates = [
-    /CSV/i, /ไฟล์\s*CSV/i,
-    /Excel/i, /XLSX?/i, /สเปรดชีต/i
-  ];
-  for (const re of candidates){
+  const choices = [/ไฟล์?\s*CSV/i, /CSV/i, /Excel/i, /XLSX?/i, /สเปรดชีต/i];
+  for (const re of choices){
     const el = page.getByText(re).first();
     if (await el.count()){
-      try { await el.click(); await page.waitForTimeout(300); return true; } catch {}
+      try { log('click CSV/Excel option:', re.toString()); await el.click(); await page.waitForTimeout(300); return true; } catch {}
     }
   }
-  // บางที export จะอยู่ใน <a download>
   const aCSV = page.locator('a[download]:has-text("CSV"), a[download]:has-text("csv")').first();
-  if (await aCSV.count()){ try { await aCSV.click(); return true; } catch {} }
+  if (await aCSV.count()){ try { log('click <a download> CSV'); await aCSV.click(); return true; } catch {} }
   return false;
 }
 
-async function waitersAndCollect(page, doClick){
+async function collectAfterClick(page, doClick){
   const w = await waiters(page);
-  await page.screenshot({ path: path.join(OUTDIR, BEFORE), fullPage: true }).catch(() => {});
+  await page.screenshot({ path: path.join(OUTDIR, BEFORE), fullPage: true }).catch(()=>{});
   await doClick();
   await page.waitForTimeout(400);
-  await clickCsvChoice(page); // ถ้ามีเมนูเลือก CSV ให้คลิก
-  await page.screenshot({ path: path.join(OUTDIR, AFTER), fullPage: true }).catch(() => {});
+  await clickCsvChoice(page);
+  await page.screenshot({ path: path.join(OUTDIR, AFTER), fullPage: true }).catch(()=>{});
   if (await saveFrom(await w.downloadP, await w.popupP, await w.responseP)) return true;
   if (await tryDumpClientSide(page)) return true;
   return false;
 }
 
 async function clickExportAnywhere(page){
-  // ปุ่มตรงๆ
+  log('try: direct Export button');
   const direct = page.locator('button:has-text("ส่งออก"), [role="button"]:has-text("ส่งออก")').first();
   if (await direct.count()){
-    const ok = await waitersAndCollect(page, async () => { await direct.click(); });
+    const ok = await collectAfterClick(page, async () => { await direct.click(); });
     if (ok) return true;
   }
-  // กดคำ "ส่งออก" จากตำแหน่งไหนก็ได้ แล้วปีน ancestor ที่คลิกได้
-  const ok2 = await waitersAndCollect(page, async () => {
+
+  log('try: click text "ส่งออก" and bubble to clickable ancestor');
+  const ok2 = await collectAfterClick(page, async () => {
     await page.evaluate(() => {
       function findNodesByText(regex){
         const all = Array.from(document.querySelectorAll('body *'));
@@ -257,10 +239,10 @@ async function clickExportAnywhere(page){
         if (el.tabIndex >= 0) return el;
         return null;
       }
-      const targets = findNodesByText(/^(ส่งออก|Export)$/i);
+      const targets = findNodesByText(/ส่งออก|Export/i);
       for (const t of targets){
         let el = t;
-        for (let i=0; i<5 && el; i++){
+        for (let i=0; i<6 && el; i++){
           const c = clickable(el);
           if (c){ c.click(); return true; }
           el = el.parentElement;
@@ -271,19 +253,21 @@ async function clickExportAnywhere(page){
   });
   if (ok2) return true;
 
-  // เมนู 3 จุด/เพิ่มเติม
+  log('try: open toolbar menus (more/actions/...) then click "ส่งออก"');
   const menus = [
-    'button:has-text("เพิ่มเติม")','button:has-text("More")','button:has-text("Actions")',
-    'button[aria-label*="More" i]','[data-testid="kebab-menu"]','button[aria-haspopup="menu"]',
+    'button[aria-haspopup="menu"]',
     'button:has([data-icon="more"])',
+    'button:has-text("เพิ่มเติม")',
+    'button:has-text("More")',
+    'button:has-text("Actions")',
   ];
   for (const m of menus){
     const btn = page.locator(m).first();
     if (await btn.count()){
-      const ok = await waitersAndCollect(page, async () => {
+      const ok = await collectAfterClick(page, async () => {
         await btn.click();
         await page.waitForTimeout(250);
-        const it = page.getByText(/^(ส่งออก|Export)$/).first();
+        const it = page.getByText(/ส่งออก|Export/i).first();
         if (await it.count()) await it.click();
       });
       if (ok) return true;
@@ -297,9 +281,13 @@ async function navigateAndExport(page){
     log('goto', url);
     await page.goto(url, { waitUntil: 'domcontentloaded' });
     await page.waitForLoadState('networkidle', { timeout: NAV_TIMEOUT });
-    await page.waitForTimeout(1200);
+    await page.waitForTimeout(1500);
     await dismissOverlays(page);
     await page.evaluate(() => window.scrollTo(0, 0));
+
+    const ready = await waitToolbar(page);
+    log('toolbar ready?', ready);
+    if (!ready) continue;
 
     const ok = await clickExportAnywhere(page);
     if (ok) return true;
