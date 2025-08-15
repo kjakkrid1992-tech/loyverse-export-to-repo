@@ -2,7 +2,7 @@ name: Loyverse Export → Save to Repo
 
 on:
   schedule:
-    - cron: "0 2 * * *"  # รันทุกวันเวลา 09:00 (UTC+7)
+    - cron: "0 2 * * *"   # 09:00 (UTC+7) ทุกวัน — GitHub ใช้เวลา UTC
   workflow_dispatch:
 
 permissions:
@@ -11,6 +11,7 @@ permissions:
 jobs:
   export:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
 
     steps:
       - name: Checkout
@@ -20,27 +21,49 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          # ไม่ใส่ cache: npm เพราะ repo ยังไม่มี lockfile
 
-      - name: Init package.json (if missing)
+      # ให้แน่ใจว่ามี package.json+lockfile และตรึง playwright เพื่อ cache ทำงาน
+      - name: Ensure package.json & lockfile
         run: |
           if [ ! -f package.json ]; then
             npm init -y
           fi
+          npm pkg set dependencies.playwright=^1.45.2
+          npm i --package-lock-only
 
-      - name: Install Playwright + Chromium (with OS deps)
-        run: |
-          npm install playwright
-          npx playwright install --with-deps chromium
+      # Cache เบราว์เซอร์ของ Playwright เพื่อให้รอบต่อไปเร็ว
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: ${{ runner.os }}-playwright-
 
-      - name: Run exporter
-        run: |
-          mkdir -p out
-          node export.js > out/log.txt 2>&1
+      - name: Install dependencies
+        run: npm ci
+        timeout-minutes: 5
+
+      - name: Install Playwright (Chromium)
+        run: npx playwright install --with-deps chromium
+        timeout-minutes: 8
+
+      - name: Run exporter (Items first)
         env:
           LOYVERSE_STORAGE_B64: ${{ secrets.LOYVERSE_STORAGE_B64 }}
-          LOYVERSE_EMAIL: ${{ secrets.LOYVERSE_EMAIL }}
-          LOYVERSE_PASSWORD: ${{ secrets.LOYVERSE_PASSWORD }}
+          # บังคับให้เริ่มที่หน้า Items (ต้องใส่เครื่องหมายคำพูดเพราะมี # ใน URL)
+          LOYVERSE_EXPORT_PAGES: "https://r.loyverse.com/dashboard/#/goods/items"
+        run: |
+          mkdir -p out
+          node export.js > out/log.txt 2>&1 || true
+        timeout-minutes: 10
+
+      - name: Summarize CSV
+        if: always()
+        run: |
+          if [ -f out/inventory.csv ]; then
+            echo "Rows (excl. header): $(( $(wc -l < out/inventory.csv) - 1 ))" | tee -a out/log.txt
+            head -n 2 out/inventory.csv >> out/log.txt || true
+          fi
 
       - name: Upload debug logs & screenshots
         if: always()
