@@ -48,8 +48,7 @@ jobs:
       - name: Run exporter (Items first)
         env:
           LOYVERSE_STORAGE_B64: ${{ secrets.LOYVERSE_STORAGE_B64 }}
-          # ต้องใส่เครื่องหมายคำพูดเพราะ URL มี # (ไม่งั้น YAML จะคิดว่าเป็นคอมเมนต์)
-          LOYVERSE_EXPORT_PAGES: "https://r.loyverse.com/dashboard/#/goods/items"
+          LOYVERSE_EXPORT_PAGES: "https://r.loyverse.com/dashboard/#/goods/items, https://r.loyverse.com/dashboard/#/inventory_by_items, https://r.loyverse.com/dashboard/#/goods/price?page=0&limit=10&inventory=all"
         run: |
           mkdir -p out
           node export.js > out/log.txt 2>&1 || true
