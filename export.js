@@ -1,4 +1,4 @@
-// export.js (v10) — Items-first + toolbar menu sweep + deep capture
+// export.js (v11) — Items-first + wait toolbar + click-by-text-anywhere + menu sweep + deep capture
 const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
@@ -9,14 +9,13 @@ const BEFORE = 'before_click.png';
 const AFTER  = 'after_click.png';
 const SCREENSHOT = 'error.png';
 
-// เริ่มจากหน้า Items ก่อน (ครบคอลัมน์/ครบสินค้า) แล้วค่อย fallback หน้าอื่น
+// เริ่มจากหน้า Items ก่อน (ครบคอลัมน์/ครบสินค้า) แล้ว fallback
 const DEFAULT_URLS = [
   'https://r.loyverse.com/dashboard/#/goods/items',
   'https://r.loyverse.com/dashboard/#/inventory_by_items',
   'https://r.loyverse.com/dashboard/#/goods/price?page=0&limit=10&inventory=all',
-  'https://r.loyverse.com/dashboard/#/inventory',
 ];
-// สามารถ override ได้ผ่าน ENV: LOYVERSE_EXPORT_PAGES="url1,url2,..."
+
 const URLS_TO_TRY = (process.env.LOYVERSE_EXPORT_PAGES
   ? process.env.LOYVERSE_EXPORT_PAGES.split(',').map(s => s.trim()).filter(Boolean)
   : DEFAULT_URLS);
@@ -29,7 +28,6 @@ function log(...a){ console.log('[log]', ...a); }
 
 async function makeContext(browser, storageState){
   const ctx = await browser.newContext({ storageState, acceptDownloads: true });
-
   // Hook กลไกดาวน์โหลดฝั่งหน้าเว็บ (Blob/objectURL, anchor, window.open, location.*)
   await ctx.addInitScript(() => {
     try {
@@ -111,6 +109,31 @@ async function dismissOverlays(page){
     if (await el.count()){ try { await el.click({ timeout:300 }); } catch{} }
   }
   try { await page.keyboard.press('Escape'); } catch {}
+}
+
+async function waitToolbar(page){
+  // รอ toolbar/ปุ่มหลัก ๆ โผล่ (สูงสุด ~15s)
+  const candidates = [
+    'button:has-text("ส่งออก")',
+    'button:has-text("นำเข้า")',
+    'button:has-text("เพิ่มเติม")',
+    'button[aria-haspopup="menu"]',
+    'button:has([data-icon="more"])',
+    '[role="button"]:has-text("ส่งออก")',
+    'text=/^\\+\\s*เพิ่มสินค้า$/',
+  ];
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline) {
+    for (const c of candidates) {
+      try {
+        const loc = c.startsWith('text=') ? page.getByText(/^\+\s*เพิ่มสินค้า$/).first()
+                                          : page.locator(c).first();
+        if (await loc.count()) return true;
+      } catch {}
+    }
+    await page.waitForTimeout(300);
+  }
+  return false;
 }
 
 async function waiters(page){
@@ -197,79 +220,52 @@ async function clickOnceAndCollect(page, clickFn){
   return false;
 }
 
-// ไล่คลิกปุ่ม/เมนูบน toolbar เพื่อหา "ส่งออก"
-async function toolbarExportSweep(page){
-  await page.evaluate(() => window.scrollTo(0,0));
-
-  // 1) ปุ่ม "ส่งออก" ตรง ๆ
-  const direct = page.locator('button:has-text("ส่งออก"), [role="button"]:has-text("ส่งออก")').first();
-  if (await direct.count()){
-    log('click direct "ส่งออก"');
-    const ok = await clickOnceAndCollect(page, async () => { await direct.click(); });
-    if (ok) return true;
-  }
-
-  // 2) หา toolbar จาก "+ เพิ่มสินค้า" แล้ววนกดปุ่มทีละอันเพื่อหาเมนู "ส่งออก"
-  const addBtn = page.getByText(/^\+\s*เพิ่มสินค้า$/).first();
-  if (await addBtn.count()){
-    log('toolbar detected near "+ เพิ่มสินค้า" -> sweeping buttons');
-    // ติดตั้ง waiters แล้วค่อยคลิกใน evaluate
-    await clickOnceAndCollect(page, async () => {});
-    const found = await page.evaluate(async () => {
-      function getToolbar(el){
-        return (el.closest('header, .toolbar, .mat-toolbar, .mdc-toolbar, .head, .panel, .top, .title-bar')
-                || document.querySelector('header, .toolbar, .mat-toolbar, .mdc-toolbar, .head, .panel, .top, .title-bar')
-                || document.body);
+// คลิกคำว่า "ส่งออก" จากที่ไหนก็ได้ในหน้า โดยไล่หา ancestor ที่คลิกได้
+async function clickTextAnywhere(page){
+  const ok = await clickOnceAndCollect(page, async () => {
+    await page.evaluate(() => {
+      function findNodesByText(regex){
+        const all = Array.from(document.querySelectorAll('body *'));
+        return all.filter(n => regex.test((n.innerText || n.textContent || '').trim()));
       }
-      const add = Array.from(document.querySelectorAll('*')).find(x => /\+\s*เพิ่มสินค้า/.test(x.textContent||''));
-      const tb = add ? getToolbar(add) : getToolbar(document.body);
-      const btns = Array.from(tb.querySelectorAll('button, [role="button"]'));
-
-      function visible(el){
-        const r = el.getBoundingClientRect();
-        const s = getComputedStyle(el);
-        return r.width>0 && r.height>0 && s.visibility!=='hidden' && s.display!=='none';
+      function clickable(el){
+        if (!el) return null;
+        const tag = el.tagName;
+        const role = el.getAttribute && (el.getAttribute('role') || '');
+        if (tag === 'BUTTON' || tag === 'A' || role === 'button') return el;
+        if (el.tabIndex >= 0) return el;
+        return null;
       }
-
-      for (const b of btns){
-        try {
-          if (!visible(b)) continue;
-          b.click();
-          await new Promise(r => setTimeout(r, 300));
-          const menuItem = Array.from(document.querySelectorAll('*')).find(x => {
-            const t=(x.innerText||x.textContent||'').trim();
-            return /^(ส่งออก|Export)$/i.test(t);
-          });
-          if (menuItem){ menuItem.click(); return true; }
-          // ปิดเมนู ถ้ายังไม่ใช่
-          document.activeElement && document.activeElement.blur && document.activeElement.blur();
-          const esc = new KeyboardEvent('keydown', {key:'Escape'});
-          document.dispatchEvent(esc);
-          await new Promise(r => setTimeout(r, 100));
-        } catch {}
+      const targets = findNodesByText(/^(ส่งออก|Export)$/i);
+      for (const t of targets){
+        let el = t;
+        for (let i=0; i<5 && el; i++){ // ไต่ขึ้นสูงสุด 5 ชั้น
+          const c = clickable(el);
+          if (c){ c.click(); return true; }
+          el = el.parentElement;
+        }
       }
       return false;
     });
-    if (found){
-      log('menu "ส่งออก" clicked from toolbar sweep');
-      const ok2 = await tryDumpClientSide(page);
-      if (ok2) return true;
-    }
-  }
+  });
+  return ok;
+}
 
-  // 3) เมนูทั่วไป (เพิ่มเติม / More / Actions / ไอคอน 3 จุด)
-  const menus = [
-    'button:has-text("เพิ่มเติม")','button:has-text("More")','button:has-text("Actions")',
-    'button[aria-label*="More" i]','[data-testid="kebab-menu"]','button:has([data-icon="more"])',
-    'button[aria-haspopup="menu"]'
+// วนคลิกปุ่มเมนูทุกปุ่มบน toolbar แล้วหา "ส่งออก"
+async function sweepToolbarMenus(page){
+  const selectors = [
+    'button[aria-haspopup="menu"]',
+    'button:has([data-icon="more"])',
+    'button:has-text("เพิ่มเติม")',
+    'button:has-text("More")',
+    'button:has-text("Actions")',
   ];
-  for (const m of menus){
-    const btn = page.locator(m).first();
+  for (const s of selectors){
+    const btn = page.locator(s).first();
     if (await btn.count()){
-      log('open menu candidate:', m);
       const ok = await clickOnceAndCollect(page, async () => {
         await btn.click();
-        await page.waitForTimeout(200);
+        await page.waitForTimeout(300);
         const it = page.getByText(/^(ส่งออก|Export)$/).first();
         if (await it.count()) await it.click();
       });
@@ -284,11 +280,32 @@ async function navigateAndExport(page){
     log('goto', url);
     await page.goto(url, { waitUntil: 'domcontentloaded' });
     await page.waitForLoadState('networkidle', { timeout: NAV_TIMEOUT });
-    await page.waitForTimeout(1200);
+    await page.waitForTimeout(1500);
     await dismissOverlays(page);
 
-    const ok = await toolbarExportSweep(page);
-    if (ok) return true;
+    // รอ toolbar/ปุ่มต่าง ๆ แสดงผล
+    const ready = await waitToolbar(page);
+    if (!ready) { log('toolbar not ready, continue'); continue; }
+
+    // 1) ถ้ามีปุ่มส่งออกตรง ๆ
+    const direct = page.locator('button:has-text("ส่งออก"), [role="button"]:has-text("ส่งออก")').first();
+    if (await direct.count()){
+      log('click direct "ส่งออก"');
+      const ok = await clickOnceAndCollect(page, async () => { await direct.click(); });
+      if (ok) return true;
+    }
+
+    // 2) กดคำว่า "ส่งออก" จากที่ไหนก็ได้ (ปีน ancestor ที่คลิกได้)
+    log('try clickTextAnywhere');
+    if (await clickTextAnywhere(page)) return true;
+
+    // 3) วนเปิดเมนูบน toolbar แล้วหา "ส่งออก"
+    log('sweep toolbar menus');
+    if (await sweepToolbarMenus(page)) return true;
+
+    // 4) เผื่อยัง หาใน overlay ทั่วหน้าอีกครั้ง
+    log('final try clickTextAnywhere');
+    if (await clickTextAnywhere(page)) return true;
   }
   return false;
 }
@@ -308,7 +325,7 @@ async function navigateAndExport(page){
   try {
     const page = await context.newPage();
     const ok = await navigateAndExport(page);
-    if (!ok) throw new Error('ยังไม่พบไฟล์ CSV หลังพยายามคลิก "ส่งออก" บนหน้า Items/ฯลฯ');
+    if (!ok) throw new Error('ยังไม่พบไฟล์ CSV หลังพยายามคลิก "ส่งออก" (Items/Inventory/Price)');
     console.log('[ok] Downloaded:', path.join(OUTDIR, CSV_FILENAME));
   } catch (err) {
     console.error('[error]', err.message);
