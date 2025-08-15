@@ -147,7 +147,7 @@ async function tryDumpClientSide(page){
         const collectText = async (u) => {
           if (!u) return null;
           if (u.startsWith('data:')){ const i=u.indexOf(','); if (i>-1){ try { return atob(u.slice(i+1)); } catch { return null; } } }
-          const res = await fetch(u); return await res.text();
+        const res = await fetch(u); return await res.text();
         };
         const e = window.__dl || { blobs:{}, hrefs:[], opens:[], locs:[] };
         const blobUrls = Object.keys(e.blobs || {});
@@ -192,25 +192,20 @@ async function sweepToolbar(page){
     await page.evaluate(() => {
       function visible(el){ const r=el.getBoundingClientRect(); const s=getComputedStyle(el); return r.width>0 && r.height>0 && s.visibility!=='hidden' && s.display!=='none'; }
       function click(el){ try{ el.click(); }catch(e){} }
-      // หา container ใกล้ปุ่ม "+ เพิ่มสินค้า"
       const add = Array.from(document.querySelectorAll('*')).find(x => /\+\s*เพิ่มสินค้า/.test((x.innerText||x.textContent||'')));
       const root = add ? (add.closest('header, .toolbar, .mat-toolbar, .mdc-toolbar, .head, .top, .panel, .title-bar') || add.parentElement || document.body)
                        : (document.querySelector('header, .toolbar, .mat-toolbar, .mdc-toolbar, .head, .top, .panel, .title-bar') || document.body);
-      // 1) กดปุ่มที่บอกว่า "ส่งออก" ผ่าน aria/title/data-title
       const attrBtns = Array.from(root.querySelectorAll('button,[role="button"],[title],[aria-label],[data-title]'))
         .filter(visible)
         .filter(el => /ส่งออก|export/i.test([el.getAttribute('aria-label')||'', el.getAttribute('title')||'', el.getAttribute('data-title')||'', el.textContent||''].join(' ')));
       if (attrBtns.length){ click(attrBtns[0]); return; }
-      // 2) ถ้ายังไม่เจอ กดตามลำดับ: ปุ่มใกล้ "+ เพิ่มสินค้า" ทางขวา ๆ (เช่น นำเข้า → ส่งออก → …)
       const buttons = Array.from(root.querySelectorAll('button,[role="button"]')).filter(visible);
-      // ลองปุ่มลำดับที่ 3 และ 4 เป็นพิเศษ (ตาม UI ที่แชร์)
       const idx = [2,3,0,1,4,5];
       for (const i of idx){ if (buttons[i]) { click(buttons[i]); return; } }
     });
   });
 }
 
-// คลิกคำว่า "ส่งออก" จากทั้งหน้า (ปีน ancestor ที่คลิกได้)
 async function clickTextAnywhere(page){
   return await collectAfterClick(page, async () => {
     await page.evaluate(() => {
@@ -257,15 +252,12 @@ async function navigateAndExport(page){
     log('toolbar ready?', ready);
     if (!ready) continue;
 
-    // 1) ลองไล่กดปุ่มบน toolbar ทั้งหมด
     log('sweep toolbar');
     if (await sweepToolbar(page)) return true;
 
-    // 2) คลิกคำว่า "ส่งออก" ที่ไหนก็ได้
     log('clickTextAnywhere');
     if (await clickTextAnywhere(page)) return true;
 
-    // 3) เปิดเมนู 3 จุด / More / Actions
     log('clickMenus');
     if (await clickMenus(page)) return true;
   }
