@@ -1,4 +1,4 @@
-// export.js (v11) — Items-first + wait toolbar + click-by-text-anywhere + menu sweep + deep capture
+// export.js (v12) — Items-first + click CSV option + CSV validation + deep capture
 const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
@@ -9,13 +9,11 @@ const BEFORE = 'before_click.png';
 const AFTER  = 'after_click.png';
 const SCREENSHOT = 'error.png';
 
-// เริ่มจากหน้า Items ก่อน (ครบคอลัมน์/ครบสินค้า) แล้ว fallback
 const DEFAULT_URLS = [
   'https://r.loyverse.com/dashboard/#/goods/items',
   'https://r.loyverse.com/dashboard/#/inventory_by_items',
   'https://r.loyverse.com/dashboard/#/goods/price?page=0&limit=10&inventory=all',
 ];
-
 const URLS_TO_TRY = (process.env.LOYVERSE_EXPORT_PAGES
   ? process.env.LOYVERSE_EXPORT_PAGES.split(',').map(s => s.trim()).filter(Boolean)
   : DEFAULT_URLS);
@@ -26,9 +24,18 @@ const NAV_TIMEOUT = 90000;
 function ensureOutDir(){ if (!fs.existsSync(OUTDIR)) fs.mkdirSync(OUTDIR, { recursive: true }); }
 function log(...a){ console.log('[log]', ...a); }
 
+function looksLikeCSV(txt){
+  if (!txt || typeof txt !== 'string') return false;
+  const t = txt.slice(0, 2000).toLowerCase();
+  if (t.includes('<html') || t.includes('<svg') || t.includes('<body')) return false;
+  const lines = txt.split(/\r?\n/).filter(Boolean);
+  if (lines.length < 2) return false;
+  const sep = [',',';','\t'].find(s => (lines[0].split(s).length + lines[1].split(s).length) > 3);
+  return !!sep;
+}
+
 async function makeContext(browser, storageState){
   const ctx = await browser.newContext({ storageState, acceptDownloads: true });
-  // Hook กลไกดาวน์โหลดฝั่งหน้าเว็บ (Blob/objectURL, anchor, window.open, location.*)
   await ctx.addInitScript(() => {
     try {
       window.__dl = { blobs:{}, hrefs:[], opens:[], locs:[] };
@@ -48,9 +55,7 @@ async function makeContext(browser, storageState){
 
       const origSetAttr = Element.prototype.setAttribute;
       Element.prototype.setAttribute = function(k,v){
-        try {
-          if (this.tagName === 'A' && k.toLowerCase()==='href') window.__dl.hrefs.push(String(v||''));
-        } catch {}
+        try { if (this.tagName === 'A' && k.toLowerCase()==='href') window.__dl.hrefs.push(String(v||'')); } catch {}
         return origSetAttr.call(this, k, v);
       };
 
@@ -111,31 +116,6 @@ async function dismissOverlays(page){
   try { await page.keyboard.press('Escape'); } catch {}
 }
 
-async function waitToolbar(page){
-  // รอ toolbar/ปุ่มหลัก ๆ โผล่ (สูงสุด ~15s)
-  const candidates = [
-    'button:has-text("ส่งออก")',
-    'button:has-text("นำเข้า")',
-    'button:has-text("เพิ่มเติม")',
-    'button[aria-haspopup="menu"]',
-    'button:has([data-icon="more"])',
-    '[role="button"]:has-text("ส่งออก")',
-    'text=/^\\+\\s*เพิ่มสินค้า$/',
-  ];
-  const deadline = Date.now() + 15000;
-  while (Date.now() < deadline) {
-    for (const c of candidates) {
-      try {
-        const loc = c.startsWith('text=') ? page.getByText(/^\+\s*เพิ่มสินค้า$/).first()
-                                          : page.locator(c).first();
-        if (await loc.count()) return true;
-      } catch {}
-    }
-    await page.waitForTimeout(300);
-  }
-  return false;
-}
-
 async function waiters(page){
   const downloadP = page.context().waitForEvent('download', { timeout: DL_TIMEOUT }).catch(() => null);
   const popupP    = page.waitForEvent('popup', { timeout: 5000 }).catch(() => null);
@@ -143,34 +123,50 @@ async function waiters(page){
     const ct = (r.headers()['content-type'] || '').toLowerCase();
     const cd = (r.headers()['content-disposition'] || '').toLowerCase();
     const url = r.url();
-    return /text\/csv|application\/octet-stream|excel/.test(ct) || /attachment/.test(cd) || /export|download|csv/i.test(url);
+    return /text\/csv|application\/octet-stream|excel|spreadsheet/.test(ct) || /attachment/.test(cd) || /export|download|csv|xlsx?/i.test(url);
   }, { timeout: DL_TIMEOUT }).catch(() => null);
   return { downloadP, popupP, responseP };
 }
 
 async function saveFrom(download, popup, response){
   const dst = path.join(OUTDIR, CSV_FILENAME);
-  if (download){ await download.saveAs(dst); return true; }
+  if (download){
+    await download.saveAs(dst);
+    const txt = fs.readFileSync(dst, 'utf8');
+    if (looksLikeCSV(txt)) return true;
+    fs.unlinkSync(dst); // ทิ้งถ้าไม่ใช่ CSV
+  }
   if (popup){
     try {
       await popup.waitForLoadState('domcontentloaded', { timeout: 8000 });
       const resp = await popup.waitForResponse(r => {
         const ct = (r.headers()['content-type'] || '').toLowerCase();
         const cd = (r.headers()['content-disposition'] || '').toLowerCase();
-        return /text\/csv|application\/octet-stream|excel/.test(ct) || /attachment/.test(cd);
+        return /text\/csv|application\/octet-stream|excel|spreadsheet/.test(ct) || /attachment/.test(cd);
       }, { timeout: 8000 }).catch(() => null);
-      if (resp){ const body = await resp.body(); fs.writeFileSync(dst, body); return true; }
+      if (resp){
+        const body = await resp.body();
+        fs.writeFileSync(dst, body);
+        const txt = fs.readFileSync(dst, 'utf8');
+        if (looksLikeCSV(txt)) return true;
+        fs.unlinkSync(dst);
+      }
     } catch {}
   }
   if (response){
-    try { const body = await response.body(); fs.writeFileSync(dst, body); return true; }
-    catch {}
+    try {
+      const body = await response.body();
+      fs.writeFileSync(dst, body);
+      const txt = fs.readFileSync(dst, 'utf8');
+      if (looksLikeCSV(txt)) return true;
+      fs.unlinkSync(dst);
+    } catch {}
   }
   return false;
 }
 
 async function tryDumpClientSide(page){
-  const end = Date.now() + 8000;
+  const end = Date.now() + 10000;
   while (Date.now() < end){
     const got = await page.evaluate(async () => {
       const out = { ok:false, csv:null, info:null };
@@ -181,26 +177,25 @@ async function tryDumpClientSide(page){
             const i = u.indexOf(',');
             if (i > -1){ try { return atob(u.slice(i+1)); } catch { return null; } }
           }
-          const res = await fetch(u); return await res.text();
+          const res = await fetch(u);
+          return await res.text();
         };
         const e = window.__dl || { blobs:{}, hrefs:[], opens:[], locs:[] };
         const blobUrls = Object.keys(e.blobs || {});
         if (blobUrls.length){
           const last = blobUrls[blobUrls.length-1];
           const txt = await e.blobs[last].text().catch(() => null);
-          if (txt){ out.ok = true; out.csv = txt; out.info = { via:'blob', url:last }; return out; }
+          if (txt){ return { ok:true, csv:txt, info:{via:'blob', url:last} }; }
         }
         const cand = [].concat(e.hrefs||[], e.opens||[], e.locs||[]).reverse();
         for (const u of cand){
           const txt = await collectText(u);
-          if (txt && (txt.includes(',') || txt.includes('\n'))){
-            out.ok = true; out.csv = txt; out.info = { via:'url', url:u }; return out;
-          }
+          if (txt){ return { ok:true, csv:txt, info:{via:'url', url:u} }; }
         }
-      } catch (err){ out.info = { err:String(err) }; }
+      } catch (err){ return { ok:false, info:{err:String(err)} }; }
       return out;
     });
-    if (got && got.ok && got.csv){
+    if (got && got.ok && looksLikeCSV(got.csv)){
       fs.writeFileSync(path.join(OUTDIR, CSV_FILENAME), got.csv, 'utf8');
       log('client-side capture:', JSON.stringify(got.info));
       return true;
@@ -210,19 +205,45 @@ async function tryDumpClientSide(page){
   return false;
 }
 
-async function clickOnceAndCollect(page, clickFn){
+async function clickCsvChoice(page){
+  // คลิกตัวเลือก CSV/Excel ในเมนู/โมดัล ถ้ามี
+  const candidates = [
+    /CSV/i, /ไฟล์\s*CSV/i,
+    /Excel/i, /XLSX?/i, /สเปรดชีต/i
+  ];
+  for (const re of candidates){
+    const el = page.getByText(re).first();
+    if (await el.count()){
+      try { await el.click(); await page.waitForTimeout(300); return true; } catch {}
+    }
+  }
+  // บางที export จะอยู่ใน <a download>
+  const aCSV = page.locator('a[download]:has-text("CSV"), a[download]:has-text("csv")').first();
+  if (await aCSV.count()){ try { await aCSV.click(); return true; } catch {} }
+  return false;
+}
+
+async function waitersAndCollect(page, doClick){
   const w = await waiters(page);
   await page.screenshot({ path: path.join(OUTDIR, BEFORE), fullPage: true }).catch(() => {});
-  await clickFn();
+  await doClick();
+  await page.waitForTimeout(400);
+  await clickCsvChoice(page); // ถ้ามีเมนูเลือก CSV ให้คลิก
   await page.screenshot({ path: path.join(OUTDIR, AFTER), fullPage: true }).catch(() => {});
   if (await saveFrom(await w.downloadP, await w.popupP, await w.responseP)) return true;
   if (await tryDumpClientSide(page)) return true;
   return false;
 }
 
-// คลิกคำว่า "ส่งออก" จากที่ไหนก็ได้ในหน้า โดยไล่หา ancestor ที่คลิกได้
-async function clickTextAnywhere(page){
-  const ok = await clickOnceAndCollect(page, async () => {
+async function clickExportAnywhere(page){
+  // ปุ่มตรงๆ
+  const direct = page.locator('button:has-text("ส่งออก"), [role="button"]:has-text("ส่งออก")').first();
+  if (await direct.count()){
+    const ok = await waitersAndCollect(page, async () => { await direct.click(); });
+    if (ok) return true;
+  }
+  // กดคำ "ส่งออก" จากตำแหน่งไหนก็ได้ แล้วปีน ancestor ที่คลิกได้
+  const ok2 = await waitersAndCollect(page, async () => {
     await page.evaluate(() => {
       function findNodesByText(regex){
         const all = Array.from(document.querySelectorAll('body *'));
@@ -239,7 +260,7 @@ async function clickTextAnywhere(page){
       const targets = findNodesByText(/^(ส่งออก|Export)$/i);
       for (const t of targets){
         let el = t;
-        for (let i=0; i<5 && el; i++){ // ไต่ขึ้นสูงสุด 5 ชั้น
+        for (let i=0; i<5 && el; i++){
           const c = clickable(el);
           if (c){ c.click(); return true; }
           el = el.parentElement;
@@ -248,24 +269,20 @@ async function clickTextAnywhere(page){
       return false;
     });
   });
-  return ok;
-}
+  if (ok2) return true;
 
-// วนคลิกปุ่มเมนูทุกปุ่มบน toolbar แล้วหา "ส่งออก"
-async function sweepToolbarMenus(page){
-  const selectors = [
-    'button[aria-haspopup="menu"]',
+  // เมนู 3 จุด/เพิ่มเติม
+  const menus = [
+    'button:has-text("เพิ่มเติม")','button:has-text("More")','button:has-text("Actions")',
+    'button[aria-label*="More" i]','[data-testid="kebab-menu"]','button[aria-haspopup="menu"]',
     'button:has([data-icon="more"])',
-    'button:has-text("เพิ่มเติม")',
-    'button:has-text("More")',
-    'button:has-text("Actions")',
   ];
-  for (const s of selectors){
-    const btn = page.locator(s).first();
+  for (const m of menus){
+    const btn = page.locator(m).first();
     if (await btn.count()){
-      const ok = await clickOnceAndCollect(page, async () => {
+      const ok = await waitersAndCollect(page, async () => {
         await btn.click();
-        await page.waitForTimeout(300);
+        await page.waitForTimeout(250);
         const it = page.getByText(/^(ส่งออก|Export)$/).first();
         if (await it.count()) await it.click();
       });
@@ -280,32 +297,12 @@ async function navigateAndExport(page){
     log('goto', url);
     await page.goto(url, { waitUntil: 'domcontentloaded' });
     await page.waitForLoadState('networkidle', { timeout: NAV_TIMEOUT });
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(1200);
     await dismissOverlays(page);
+    await page.evaluate(() => window.scrollTo(0, 0));
 
-    // รอ toolbar/ปุ่มต่าง ๆ แสดงผล
-    const ready = await waitToolbar(page);
-    if (!ready) { log('toolbar not ready, continue'); continue; }
-
-    // 1) ถ้ามีปุ่มส่งออกตรง ๆ
-    const direct = page.locator('button:has-text("ส่งออก"), [role="button"]:has-text("ส่งออก")').first();
-    if (await direct.count()){
-      log('click direct "ส่งออก"');
-      const ok = await clickOnceAndCollect(page, async () => { await direct.click(); });
-      if (ok) return true;
-    }
-
-    // 2) กดคำว่า "ส่งออก" จากที่ไหนก็ได้ (ปีน ancestor ที่คลิกได้)
-    log('try clickTextAnywhere');
-    if (await clickTextAnywhere(page)) return true;
-
-    // 3) วนเปิดเมนูบน toolbar แล้วหา "ส่งออก"
-    log('sweep toolbar menus');
-    if (await sweepToolbarMenus(page)) return true;
-
-    // 4) เผื่อยัง หาใน overlay ทั่วหน้าอีกครั้ง
-    log('final try clickTextAnywhere');
-    if (await clickTextAnywhere(page)) return true;
+    const ok = await clickExportAnywhere(page);
+    if (ok) return true;
   }
   return false;
 }
@@ -325,7 +322,7 @@ async function navigateAndExport(page){
   try {
     const page = await context.newPage();
     const ok = await navigateAndExport(page);
-    if (!ok) throw new Error('ยังไม่พบไฟล์ CSV หลังพยายามคลิก "ส่งออก" (Items/Inventory/Price)');
+    if (!ok) throw new Error('ยังไม่พบไฟล์ CSV หลังพยายามคลิก "ส่งออก" + เลือก CSV');
     console.log('[ok] Downloaded:', path.join(OUTDIR, CSV_FILENAME));
   } catch (err) {
     console.error('[error]', err.message);
