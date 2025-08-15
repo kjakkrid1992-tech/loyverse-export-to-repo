@@ -1,14 +1,13 @@
-
-// export.js (v8b) — fix: catch response.body() errors + scan DOM for <a download>/blob:/data:
+// export.js (v9) — deep capture: window.open/location/anchor hooks + polling + single-click per page
 const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
 
 const OUTDIR = 'out';
 const CSV_FILENAME = 'inventory.csv';
-const SCREENSHOT = 'error.png';
 const BEFORE = 'before_click.png';
 const AFTER  = 'after_click.png';
+const SCREENSHOT = 'error.png';
 
 const URLS_TO_TRY = [
   'https://r.loyverse.com/dashboard/#/goods/price?page=0&limit=10&inventory=all',
@@ -23,7 +22,63 @@ const NAV_TIMEOUT = 90000;
 function ensureOutDir() {
   if (!fs.existsSync(OUTDIR)) fs.mkdirSync(OUTDIR, { recursive: true });
 }
-function log(...args){ console.log('[log]', ...args); }
+function log(...args) { console.log('[log]', ...args); }
+
+async function makeContext(browser, storageState) {
+  const ctx = await browser.newContext({ storageState, acceptDownloads: true });
+  // Deep hooks to capture any client-side download mechanisms
+  await ctx.addInitScript(() => {
+    try {
+      window.__dl = { blobs: {}, hrefs: [], opens: [], locs: [] };
+
+      const origCreate = URL.createObjectURL;
+      URL.createObjectURL = function(blob) {
+        const u = origCreate.call(URL, blob);
+        try { window.__dl.blobs[u] = blob; } catch {}
+        return u;
+      };
+
+      const origLinkClick = HTMLAnchorElement.prototype.click;
+      HTMLAnchorElement.prototype.click = function() {
+        try { window.__dl.hrefs.push(this.href || ''); } catch {}
+        return origLinkClick.call(this);
+      };
+
+      const origSetAttr = Element.prototype.setAttribute;
+      Element.prototype.setAttribute = function(k, v) {
+        try {
+          if (this.tagName === 'A' && k.toLowerCase() === 'href') {
+            window.__dl.hrefs.push(String(v || ''));
+          }
+        } catch {}
+        return origSetAttr.call(this, k, v);
+      };
+
+      const origOpen = window.open;
+      window.open = function(u, ...rest) {
+        try { window.__dl.opens.push(String(u || '')); } catch {}
+        return origOpen ? origOpen.call(window, u, ...rest) : null;
+      };
+
+      const origAssign = window.location.assign;
+      window.location.assign = function(u) {
+        try { window.__dl.locs.push(String(u || '')); } catch {}
+        return origAssign.call(window.location, u);
+      };
+      const hrefDesc = Object.getOwnPropertyDescriptor(Location.prototype, 'href');
+      if (hrefDesc && hrefDesc.set) {
+        Object.defineProperty(window.location, 'href', {
+          set(u) {
+            try { window.__dl.locs.push(String(u || '')); } catch {}
+            return hrefDesc.set.call(window.location, u);
+          },
+          get() { return hrefDesc.get.call(window.location); }
+        });
+      }
+    } catch (e) { /* ignore */ }
+  });
+  return ctx;
+}
 
 async function newContextWithStorage(browser) {
   const b64 = process.env.LOYVERSE_STORAGE_B64;
@@ -32,47 +87,17 @@ async function newContextWithStorage(browser) {
       const jsonText = Buffer.from(b64, 'base64').toString('utf-8');
       const storageState = JSON.parse(jsonText);
       log('use LOYVERSE_STORAGE_B64');
-      const ctx = await browser.newContext({ storageState, acceptDownloads: true });
-      await ctx.addInitScript(() => {
-        window.__dl = { blobs: {}, hrefs: [] };
-        const orig = URL.createObjectURL;
-        URL.createObjectURL = function(blob){
-          const url = orig.call(this, blob);
-          try { window.__dl.blobs[url] = blob; } catch {}
-          return url;
-        };
-        const origLink = HTMLAnchorElement.prototype.click;
-        HTMLAnchorElement.prototype.click = function(){
-          try { if (this.download && this.href) window.__dl.hrefs.push(this.href); } catch {}
-          return origLink.call(this);
-        };
-      });
-      return ctx;
+      return await makeContext(browser, storageState);
     } catch (e) {
       console.error('[storage] LOYVERSE_STORAGE_B64 parse error:', e.message);
     }
   }
-  const storagePath = path.join(OUTDIR, 'storage.json');
-  if (fs.existsSync(storagePath)) {
+  const fsPath = path.join(OUTDIR, 'storage.json');
+  if (fs.existsSync(fsPath)) {
     try {
-      const storageState = JSON.parse(fs.readFileSync(storagePath, 'utf-8'));
+      const storageState = JSON.parse(fs.readFileSync(fsPath, 'utf-8'));
       log('use out/storage.json');
-      const ctx = await browser.newContext({ storageState, acceptDownloads: true });
-      await ctx.addInitScript(() => {
-        window.__dl = { blobs: {}, hrefs: [] };
-        const orig = URL.createObjectURL;
-        URL.createObjectURL = function(blob){
-          const url = orig.call(this, blob);
-          try { window.__dl.blobs[url] = blob; } catch {}
-          return url;
-        };
-        const origLink = HTMLAnchorElement.prototype.click;
-        HTMLAnchorElement.prototype.click = function(){
-          try { if (this.download && this.href) window.__dl.hrefs.push(this.href); } catch {}
-          return origLink.call(this);
-        };
-      });
-      return ctx;
+      return await makeContext(browser, storageState);
     } catch (e) {
       console.error('[storage] out/storage.json parse error:', e.message);
     }
@@ -96,26 +121,25 @@ async function dismissOverlays(page) {
   try { await page.keyboard.press('Escape'); } catch {}
 }
 
-function namesRe() { return /Export|ส่งออก|Download|ดาวน์โหลด|นำออก|CSV|Excel|ไฟล์/i; }
+const NAMES = /Export|ส่งออก|Download|ดาวน์โหลด|นำออก|CSV|Excel|ไฟล์/i;
 
 function exportTargets(page) {
-  const re = namesRe();
   return [
-    page.getByRole('button', { name: re }).first(),
+    page.getByRole('button', { name: NAMES }).first(),
     page.locator('button:has-text("ส่งออก")').first(),
-    page.getByText(re, { exact: false }).first(),
-    page.locator('[role="button"]').filter({ hasText: re }).first(),
+    page.getByText(NAMES, { exact: false }).first(),
+    page.locator('[role="button"]').filter({ hasText: NAMES }).first(),
   ];
 }
 
-async function prepareFileWaiters(page) {
+async function waiters(page) {
   const downloadP = page.context().waitForEvent('download', { timeout: DL_TIMEOUT }).catch(() => null);
-  const popupP    = page.waitForEvent('popup', { timeout: 3000 }).catch(() => null);
+  const popupP    = page.waitForEvent('popup', { timeout: 5000 }).catch(() => null);
   const responseP = page.waitForResponse(r => {
     const ct = (r.headers()['content-type'] || '').toLowerCase();
     const cd = (r.headers()['content-disposition'] || '').toLowerCase();
     const url = r.url();
-    return /text\/csv|application\/octet-stream/.test(ct) || /attachment/.test(cd) || /export|download|csv/i.test(url);
+    return /text\/csv|application\/octet-stream|excel/.test(ct) || /attachment/.test(cd) || /export|download|csv/i.test(url);
   }, { timeout: DL_TIMEOUT }).catch(() => null);
   return { downloadP, popupP, responseP };
 }
@@ -129,78 +153,78 @@ async function saveFrom(download, popup, response) {
       const resp = await popup.waitForResponse(r => {
         const ct = (r.headers()['content-type'] || '').toLowerCase();
         const cd = (r.headers()['content-disposition'] || '').toLowerCase();
-        return /text\/csv|application\/octet-stream/.test(ct) || /attachment/.test(cd);
+        return /text\/csv|application\/octet-stream|excel/.test(ct) || /attachment/.test(cd);
       }, { timeout: 8000 }).catch(() => null);
       if (resp) { const body = await resp.body(); fs.writeFileSync(dst, body); return true; }
     } catch {}
   }
   if (response) {
-    try {
-      const body = await response.body();
-      fs.writeFileSync(dst, body);
+    try { const body = await response.body(); fs.writeFileSync(dst, body); return true; }
+    catch { /* ignore */ }
+  }
+  return false;
+}
+
+async function tryDumpClientSide(page) {
+  // Poll for up to 8s, checking any captured blobs/hrefs/opens/locs
+  const end = Date.now() + 8000;
+  while (Date.now() < end) {
+    const got = await page.evaluate(async () => {
+      const out = { ok:false, csv:null, info:null };
+      try {
+        const collectText = async (u) => {
+          if (!u) return null;
+          if (u.startsWith('data:')) {
+            const comma = u.indexOf(',');
+            if (comma > -1) {
+              const b64 = u.slice(comma+1);
+              try { return atob(b64); } catch { return null; }
+            }
+          }
+          const res = await fetch(u);
+          const text = await res.text();
+          return text;
+        };
+
+        const entries = window.__dl || { blobs:{}, hrefs:[], opens:[], locs:[] };
+        // 1) last blob
+        const blobUrls = Object.keys(entries.blobs || {});
+        if (blobUrls.length) {
+          const last = blobUrls[blobUrls.length - 1];
+          const txt = await entries.blobs[last].text().catch(() => null);
+          if (txt) { out.ok = true; out.csv = txt; out.info = { via:'blob', url:last }; return out; }
+        }
+        // 2) last href/open/loc
+        const candidates = []
+          .concat(entries.hrefs || [])
+          .concat(entries.opens || [])
+          .concat(entries.locs || [])
+          .reverse();
+        for (const u of candidates) {
+          const txt = await collectText(u);
+          if (txt && (txt.includes(',') || txt.includes('\n'))) { out.ok = true; out.csv = txt; out.info = { via:'url', url:u }; return out; }
+        }
+      } catch (e) { out.info = { err: String(e) }; }
+      return out;
+    });
+    if (got && got.ok && got.csv) {
+      fs.writeFileSync(path.join(OUTDIR, CSV_FILENAME), got.csv, 'utf8');
+      log('client-side capture:', JSON.stringify(got.info));
       return true;
-    } catch (e) {
-      console.error('[warn] response.body() failed, will try DOM-based capture:', e.message);
-      // fallthrough to DOM capture
     }
+    await page.waitForTimeout(300);
   }
   return false;
 }
 
-async function tryGrabBlobHref(page) {
-  // 1) Check objects captured by our initScript
-  const info = await page.evaluate(async () => {
-    const entry = { hrefs: (window.__dl && window.__dl.hrefs) || [], blobCount: window.__dl ? Object.keys(window.__dl.blobs).length : 0, last: null };
-    if (window.__dl && Object.keys(window.__dl.blobs).length) {
-      const urls = Object.keys(window.__dl.blobs);
-      const lastUrl = urls[urls.length - 1];
-      const blob = window.__dl.blobs[lastUrl];
-      const text = await blob.text().catch(() => null);
-      entry.last = { url: lastUrl, text };
-    }
-    return entry;
-  });
-  if (info.last && info.last.text) {
-    fs.writeFileSync(path.join(OUTDIR, CSV_FILENAME), info.last.text, 'utf8');
-    return true;
-  }
-
-  // 2) Scan DOM for <a download> or <a href^="blob:"|"data:"> created by UI
-  const domHref = await page.evaluate(async () => {
-    try {
-      const a = Array.from(document.querySelectorAll('a')).reverse().find(x => {
-        const href = x.getAttribute('href') || '';
-        return x.hasAttribute('download') || href.startsWith('blob:') || href.startsWith('data:');
-      });
-      if (!a) return null;
-      const href = a.getAttribute('href') || '';
-      if (href.startsWith('data:')) {
-        const b64 = href.split(',')[1] || '';
-        return { type: 'data', text: atob(b64) };
-      }
-      // blob: — fetch within page context
-      const res = await fetch(href);
-      const text = await res.text();
-      return { type: 'blob', text };
-    } catch (e) {
-      return null;
-    }
-  });
-  if (domHref && domHref.text) {
-    fs.writeFileSync(path.join(OUTDIR, CSV_FILENAME), domHref.text, 'utf8');
-    return true;
-  }
-
-  return false;
-}
-
-async function clickAndCollect(page, clickFn) {
-  const waiters = await prepareFileWaiters(page);
+async function clickOnceAndCollect(page, clickFn) {
+  const w = await waiters(page);
   await page.screenshot({ path: path.join(OUTDIR, BEFORE), fullPage: true }).catch(() => {});
   await clickFn();
   await page.screenshot({ path: path.join(OUTDIR, AFTER), fullPage: true }).catch(() => {});
-  if (await saveFrom(await waiters.downloadP, await waiters.popupP, await waiters.responseP)) return true;
-  return await tryGrabBlobHref(page);
+  if (await saveFrom(await w.downloadP, await w.popupP, await w.responseP)) return true;
+  if (await tryDumpClientSide(page)) return true;
+  return false;
 }
 
 async function navigateAndExport(page) {
@@ -212,34 +236,22 @@ async function navigateAndExport(page) {
     await dismissOverlays(page);
     await page.evaluate(() => window.scrollTo(0, 0));
 
-    // A) direct candidates
+    // Prefer exact Thai "ส่งออก" button in toolbar (per your screenshot)
+    const exportBtn = page.locator('button:has-text("ส่งออก")').first();
+    if (await exportBtn.count()) {
+      const ok = await clickOnceAndCollect(page, async () => { await exportBtn.click(); });
+      if (ok) return true;
+    }
+
+    // Generic candidates
     for (const t of exportTargets(page)) {
       if (await t.count()) {
-        log('click candidate');
-        const ok = await clickAndCollect(page, async () => { await t.click(); });
+        const ok = await clickOnceAndCollect(page, async () => { await t.click(); });
         if (ok) return true;
       }
     }
 
-    // B) toolbar heuristic near "+ เพิ่มสินค้า"
-    const addBtn = page.getByText(/^\\+\\s*เพิ่มสินค้า$/).first();
-    if (await addBtn.count()) {
-      log('toolbar heuristic');
-      const ok = await clickAndCollect(page, async () => {
-        const h = await addBtn.elementHandle();
-        await page.evaluate((el) => {
-          const tb = el.closest('header, .toolbar, .mat-toolbar, .mdc-toolbar, .head, .panel, .top, .title-bar') || document.body;
-          const nodes = tb.querySelectorAll('button, a, [role="button"]');
-          for (const n of nodes) {
-            const t = (n.innerText || n.textContent || '').trim();
-            if (/^ส่งออก$|Export|ดาวน์โหลด|Download/i.test(t)) { n.click(); return; }
-          }
-        }, h);
-      });
-      if (ok) return true;
-    }
-
-    // C) overflow menus
+    // Overflow menus path
     const menus = [
       'button:has-text("เพิ่มเติม")',
       'button:has-text("More")',
@@ -251,11 +263,10 @@ async function navigateAndExport(page) {
     for (const m of menus) {
       const btn = page.locator(m).first();
       if (await btn.count()) {
-        log('open menu', m);
-        const ok = await clickAndCollect(page, async () => {
+        const ok = await clickOnceAndCollect(page, async () => {
           await btn.click();
           await page.waitForTimeout(200);
-          const it = page.getByText(namesRe()).first();
+          const it = page.getByText(NAMES).first();
           if (await it.count()) await it.click();
         });
         if (ok) return true;
@@ -280,13 +291,13 @@ async function navigateAndExport(page) {
   try {
     const page = await context.newPage();
     const ok = await navigateAndExport(page);
-    if (!ok) throw new Error('ยังไม่พบไฟล์ CSV หลังคลิก "ส่งออก" — UI อาจสร้างไฟล์จากหน้าเว็บโดยตรง');
+    if (!ok) throw new Error('ยังไม่พบไฟล์ CSV หลังคลิก "ส่งออก" — UI อาจสร้างไฟล์จากหน้าเว็บโดยไม่ออก event/network ที่ดึงได้');
     console.log('[ok] Downloaded:', path.join(OUTDIR, CSV_FILENAME));
   } catch (err) {
     console.error('[error]', err.message);
     try {
       const pg = await context.newPage();
-      await pg.goto('https://r.loyverse.com/dashboard/#/goods/price?page=0&limit=10&inventory=all', { waitUntil: 'domcontentloaded' }).catch(() => {});
+      await pg.goto(URLS_TO_TRY[0], { waitUntil: 'domcontentloaded' }).catch(() => {});
       await pg.screenshot({ path: path.join(OUTDIR, SCREENSHOT), fullPage: true }).catch(() => {});
       await pg.close();
       console.error('[error] saved screenshot to out/error.png');
