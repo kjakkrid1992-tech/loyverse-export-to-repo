@@ -1,4 +1,4 @@
-// export.js (v9) — deep capture: window.open/location/anchor hooks + polling + single-click per page
+// export.js (items-first) — deep capture: window.open/location/anchor hooks + polling
 const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
@@ -9,24 +9,27 @@ const BEFORE = 'before_click.png';
 const AFTER  = 'after_click.png';
 const SCREENSHOT = 'error.png';
 
-const URLS_TO_TRY = [
-  'https://r.loyverse.com/dashboard/#/goods/price?page=0&limit=10&inventory=all',
+// ✅ ใช้หน้า Items เป็นค่าเริ่มต้น (ครบคอลัมน์/ครบสินค้า)
+const DEFAULT_URLS = [
   'https://r.loyverse.com/dashboard/#/goods/items',
   'https://r.loyverse.com/dashboard/#/inventory_by_items',
+  'https://r.loyverse.com/dashboard/#/goods/price?page=0&limit=10&inventory=all',
   'https://r.loyverse.com/dashboard/#/inventory',
 ];
+// สามารถ override ได้ด้วย ENV: LOYVERSE_EXPORT_PAGES="url1,url2,..."
+const URLS_TO_TRY = (process.env.LOYVERSE_EXPORT_PAGES
+  ? process.env.LOYVERSE_EXPORT_PAGES.split(',').map(s => s.trim()).filter(Boolean)
+  : DEFAULT_URLS);
 
-const DL_TIMEOUT = 120000;
-const NAV_TIMEOUT = 90000;
+const DL_TIMEOUT = 120000;  // 120s
+const NAV_TIMEOUT = 90000;  // 90s
 
-function ensureOutDir() {
-  if (!fs.existsSync(OUTDIR)) fs.mkdirSync(OUTDIR, { recursive: true });
-}
+function ensureOutDir() { if (!fs.existsSync(OUTDIR)) fs.mkdirSync(OUTDIR, { recursive: true }); }
 function log(...args) { console.log('[log]', ...args); }
 
 async function makeContext(browser, storageState) {
   const ctx = await browser.newContext({ storageState, acceptDownloads: true });
-  // Deep hooks to capture any client-side download mechanisms
+  // Hook กลไกดาวน์โหลดฝั่งหน้าเว็บ (Blob/objectURL, anchor, window.open, location.*)
   await ctx.addInitScript(() => {
     try {
       window.__dl = { blobs: {}, hrefs: [], opens: [], locs: [] };
@@ -68,14 +71,11 @@ async function makeContext(browser, storageState) {
       const hrefDesc = Object.getOwnPropertyDescriptor(Location.prototype, 'href');
       if (hrefDesc && hrefDesc.set) {
         Object.defineProperty(window.location, 'href', {
-          set(u) {
-            try { window.__dl.locs.push(String(u || '')); } catch {}
-            return hrefDesc.set.call(window.location, u);
-          },
+          set(u) { try { window.__dl.locs.push(String(u || '')); } catch {} ; return hrefDesc.set.call(window.location, u); },
           get() { return hrefDesc.get.call(window.location); }
         });
       }
-    } catch (e) { /* ignore */ }
+    } catch {}
   });
   return ctx;
 }
@@ -88,9 +88,7 @@ async function newContextWithStorage(browser) {
       const storageState = JSON.parse(jsonText);
       log('use LOYVERSE_STORAGE_B64');
       return await makeContext(browser, storageState);
-    } catch (e) {
-      console.error('[storage] LOYVERSE_STORAGE_B64 parse error:', e.message);
-    }
+    } catch (e) { console.error('[storage] LOYVERSE_STORAGE_B64 parse error:', e.message); }
   }
   const fsPath = path.join(OUTDIR, 'storage.json');
   if (fs.existsSync(fsPath)) {
@@ -98,9 +96,7 @@ async function newContextWithStorage(browser) {
       const storageState = JSON.parse(fs.readFileSync(fsPath, 'utf-8'));
       log('use out/storage.json');
       return await makeContext(browser, storageState);
-    } catch (e) {
-      console.error('[storage] out/storage.json parse error:', e.message);
-    }
+    } catch (e) { console.error('[storage] out/storage.json parse error:', e.message); }
   }
   throw new Error('Missing login credentials. Provide LOYVERSE_STORAGE_B64 or out/storage.json');
 }
@@ -166,7 +162,7 @@ async function saveFrom(download, popup, response) {
 }
 
 async function tryDumpClientSide(page) {
-  // Poll for up to 8s, checking any captured blobs/hrefs/opens/locs
+  // Poll จับ Blob/objectURL/URL เปิดใหม่ (สูงสุด ~8s)
   const end = Date.now() + 8000;
   while (Date.now() < end) {
     const got = await page.evaluate(async () => {
@@ -176,25 +172,21 @@ async function tryDumpClientSide(page) {
           if (!u) return null;
           if (u.startsWith('data:')) {
             const comma = u.indexOf(',');
-            if (comma > -1) {
-              const b64 = u.slice(comma+1);
-              try { return atob(b64); } catch { return null; }
-            }
+            if (comma > -1) { try { return atob(u.slice(comma+1)); } catch { return null; } }
           }
           const res = await fetch(u);
-          const text = await res.text();
-          return text;
+          return await res.text();
         };
 
         const entries = window.__dl || { blobs:{}, hrefs:[], opens:[], locs:[] };
-        // 1) last blob
+        // 1) Blob ล่าสุด
         const blobUrls = Object.keys(entries.blobs || {});
         if (blobUrls.length) {
           const last = blobUrls[blobUrls.length - 1];
           const txt = await entries.blobs[last].text().catch(() => null);
           if (txt) { out.ok = true; out.csv = txt; out.info = { via:'blob', url:last }; return out; }
         }
-        // 2) last href/open/loc
+        // 2) href/open/location ล่าสุด
         const candidates = []
           .concat(entries.hrefs || [])
           .concat(entries.opens || [])
@@ -202,7 +194,9 @@ async function tryDumpClientSide(page) {
           .reverse();
         for (const u of candidates) {
           const txt = await collectText(u);
-          if (txt && (txt.includes(',') || txt.includes('\n'))) { out.ok = true; out.csv = txt; out.info = { via:'url', url:u }; return out; }
+          if (txt && (txt.includes(',') || txt.includes('\n'))) {
+            out.ok = true; out.csv = txt; out.info = { via:'url', url:u }; return out;
+          }
         }
       } catch (e) { out.info = { err: String(e) }; }
       return out;
@@ -236,14 +230,14 @@ async function navigateAndExport(page) {
     await dismissOverlays(page);
     await page.evaluate(() => window.scrollTo(0, 0));
 
-    // Prefer exact Thai "ส่งออก" button in toolbar (per your screenshot)
+    // ปุ่ม "ส่งออก" บน toolbar (ภาษาไทย)
     const exportBtn = page.locator('button:has-text("ส่งออก")').first();
     if (await exportBtn.count()) {
       const ok = await clickOnceAndCollect(page, async () => { await exportBtn.click(); });
       if (ok) return true;
     }
 
-    // Generic candidates
+    // ผู้สมัครทั่วไป
     for (const t of exportTargets(page)) {
       if (await t.count()) {
         const ok = await clickOnceAndCollect(page, async () => { await t.click(); });
@@ -251,7 +245,7 @@ async function navigateAndExport(page) {
       }
     }
 
-    // Overflow menus path
+    // เมนู 3 จุด/เพิ่มเติม
     const menus = [
       'button:has-text("เพิ่มเติม")',
       'button:has-text("More")',
@@ -291,7 +285,7 @@ async function navigateAndExport(page) {
   try {
     const page = await context.newPage();
     const ok = await navigateAndExport(page);
-    if (!ok) throw new Error('ยังไม่พบไฟล์ CSV หลังคลิก "ส่งออก" — UI อาจสร้างไฟล์จากหน้าเว็บโดยไม่ออก event/network ที่ดึงได้');
+    if (!ok) throw new Error('ยังไม่พบไฟล์ CSV หลังคลิก "ส่งออก"');
     console.log('[ok] Downloaded:', path.join(OUTDIR, CSV_FILENAME));
   } catch (err) {
     console.error('[error]', err.message);
