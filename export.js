@@ -9,12 +9,14 @@ const BEFORE = 'before_click.png';
 const AFTER  = 'after_click.png';
 const SCREENSHOT = 'error.png';
 
+// เริ่มจากหน้า Items ก่อน (ครบคอลัมน์/ครบสินค้า) แล้วค่อย fallback หน้าอื่น
 const DEFAULT_URLS = [
   'https://r.loyverse.com/dashboard/#/goods/items',
   'https://r.loyverse.com/dashboard/#/inventory_by_items',
   'https://r.loyverse.com/dashboard/#/goods/price?page=0&limit=10&inventory=all',
   'https://r.loyverse.com/dashboard/#/inventory',
 ];
+// สามารถ override ได้ผ่าน ENV: LOYVERSE_EXPORT_PAGES="url1,url2,..."
 const URLS_TO_TRY = (process.env.LOYVERSE_EXPORT_PAGES
   ? process.env.LOYVERSE_EXPORT_PAGES.split(',').map(s => s.trim()).filter(Boolean)
   : DEFAULT_URLS);
@@ -27,6 +29,8 @@ function log(...a){ console.log('[log]', ...a); }
 
 async function makeContext(browser, storageState){
   const ctx = await browser.newContext({ storageState, acceptDownloads: true });
+
+  // Hook กลไกดาวน์โหลดฝั่งหน้าเว็บ (Blob/objectURL, anchor, window.open, location.*)
   await ctx.addInitScript(() => {
     try {
       window.__dl = { blobs:{}, hrefs:[], opens:[], locs:[] };
@@ -108,8 +112,6 @@ async function dismissOverlays(page){
   }
   try { await page.keyboard.press('Escape'); } catch {}
 }
-
-const NAMES = /Export|ส่งออก|Download|ดาวน์โหลด|นำออก|CSV|Excel|ไฟล์/i;
 
 async function waiters(page){
   const downloadP = page.context().waitForEvent('download', { timeout: DL_TIMEOUT }).catch(() => null);
@@ -195,11 +197,11 @@ async function clickOnceAndCollect(page, clickFn){
   return false;
 }
 
-// ===== จุดสำคัญ: ไล่คลิกปุ่ม/เมนูบน toolbar เพื่อหา "ส่งออก" =====
+// ไล่คลิกปุ่ม/เมนูบน toolbar เพื่อหา "ส่งออก"
 async function toolbarExportSweep(page){
   await page.evaluate(() => window.scrollTo(0,0));
 
-  // 1) ถ้ามีปุ่ม "ส่งออก" ตรง ๆ
+  // 1) ปุ่ม "ส่งออก" ตรง ๆ
   const direct = page.locator('button:has-text("ส่งออก"), [role="button"]:has-text("ส่งออก")').first();
   if (await direct.count()){
     log('click direct "ส่งออก"');
@@ -207,20 +209,12 @@ async function toolbarExportSweep(page){
     if (ok) return true;
   }
 
-  // 2) หา toolbar จาก "+ เพิ่มสินค้า" แล้ววนคลิกปุ่มทุกอันใน toolbar
+  // 2) หา toolbar จาก "+ เพิ่มสินค้า" แล้ววนกดปุ่มทีละอันเพื่อหาเมนู "ส่งออก"
   const addBtn = page.getByText(/^\+\s*เพิ่มสินค้า$/).first();
   if (await addBtn.count()){
     log('toolbar detected near "+ เพิ่มสินค้า" -> sweeping buttons');
-    const h = await addBtn.elementHandle();
-    const clicked = await clickOnceAndCollect(page, async () => {
-      await page.evaluate(() => {
-        // ทำ flag global ให้ script ถัดไปรู้ว่าเราเริ่ม sweep แล้ว
-        window.__startSweep = Date.now();
-      });
-    });
-    // (ไม่คลิกอะไรจริงในรอบนี้ แค่ setup waiters)
-
-    // วนคลิกปุ่มใน toolbar ทีละปุ่ม แล้วหาเมนูที่มีคำว่า "ส่งออก"
+    // ติดตั้ง waiters แล้วค่อยคลิกใน evaluate
+    await clickOnceAndCollect(page, async () => {});
     const found = await page.evaluate(async () => {
       function getToolbar(el){
         return (el.closest('header, .toolbar, .mat-toolbar, .mdc-toolbar, .head, .panel, .top, .title-bar')
@@ -237,7 +231,6 @@ async function toolbarExportSweep(page){
         return r.width>0 && r.height>0 && s.visibility!=='hidden' && s.display!=='none';
       }
 
-      // คลิกทีละปุ่ม แล้วเช็ค overlay/menu ว่ามี "ส่งออก" ไหม
       for (const b of btns){
         try {
           if (!visible(b)) continue;
@@ -247,11 +240,8 @@ async function toolbarExportSweep(page){
             const t=(x.innerText||x.textContent||'').trim();
             return /^(ส่งออก|Export)$/i.test(t);
           });
-          if (menuItem){
-            menuItem.click();
-            return true;
-          }
-          // ปิดเมนูถ้าไม่ใช่
+          if (menuItem){ menuItem.click(); return true; }
+          // ปิดเมนู ถ้ายังไม่ใช่
           document.activeElement && document.activeElement.blur && document.activeElement.blur();
           const esc = new KeyboardEvent('keydown', {key:'Escape'});
           document.dispatchEvent(esc);
@@ -261,9 +251,7 @@ async function toolbarExportSweep(page){
       return false;
     });
     if (found){
-      // รอให้ hook จับไฟล์ต่อใน clickOnceAndCollect รอบก่อนหน้า
       log('menu "ส่งออก" clicked from toolbar sweep');
-      // รอผลเก็บไฟล์แบบ client-side/response/download เพิ่มอีกเล็กน้อย
       const ok2 = await tryDumpClientSide(page);
       if (ok2) return true;
     }
@@ -299,7 +287,6 @@ async function navigateAndExport(page){
     await page.waitForTimeout(1200);
     await dismissOverlays(page);
 
-    // ไล่หา "ส่งออก" ให้เจอ แม้อยู่ในเมนู
     const ok = await toolbarExportSweep(page);
     if (ok) return true;
   }
