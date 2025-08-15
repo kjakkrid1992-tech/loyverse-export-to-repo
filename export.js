@@ -1,4 +1,5 @@
-// export.js (v8-fix) — ultimate fallback: capture Blob/objectURL downloads
+
+// export.js (v8b) — fix: catch response.body() errors + scan DOM for <a download>/blob:/data:
 const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
@@ -33,7 +34,6 @@ async function newContextWithStorage(browser) {
       log('use LOYVERSE_STORAGE_B64');
       const ctx = await browser.newContext({ storageState, acceptDownloads: true });
       await ctx.addInitScript(() => {
-        // Hook objectURL to capture Blobs used for download
         window.__dl = { blobs: {}, hrefs: [] };
         const orig = URL.createObjectURL;
         URL.createObjectURL = function(blob){
@@ -134,11 +134,21 @@ async function saveFrom(download, popup, response) {
       if (resp) { const body = await resp.body(); fs.writeFileSync(dst, body); return true; }
     } catch {}
   }
-  if (response) { const body = await response.body(); fs.writeFileSync(dst, body); return true; }
+  if (response) {
+    try {
+      const body = await response.body();
+      fs.writeFileSync(dst, body);
+      return true;
+    } catch (e) {
+      console.error('[warn] response.body() failed, will try DOM-based capture:', e.message);
+      // fallthrough to DOM capture
+    }
+  }
   return false;
 }
 
 async function tryGrabBlobHref(page) {
+  // 1) Check objects captured by our initScript
   const info = await page.evaluate(async () => {
     const entry = { hrefs: (window.__dl && window.__dl.hrefs) || [], blobCount: window.__dl ? Object.keys(window.__dl.blobs).length : 0, last: null };
     if (window.__dl && Object.keys(window.__dl.blobs).length) {
@@ -154,24 +164,33 @@ async function tryGrabBlobHref(page) {
     fs.writeFileSync(path.join(OUTDIR, CSV_FILENAME), info.last.text, 'utf8');
     return true;
   }
-  if (info.hrefs && info.hrefs.length) {
-    const href = info.hrefs[info.hrefs.length - 1];
-    const content = await page.evaluate(async (h) => {
-      try {
-        if (h.startsWith('data:')) {
-          const b64 = h.split(',')[1];
-          return Buffer.from(b64, 'base64').toString('utf-8');
-        }
-        const res = await fetch(h);
-        const txt = await res.text();
-        return txt;
-      } catch (e) { return null; }
-    }, href);
-    if (content) {
-      fs.writeFileSync(path.join(OUTDIR, CSV_FILENAME), content, 'utf8');
-      return true;
+
+  // 2) Scan DOM for <a download> or <a href^="blob:"|"data:"> created by UI
+  const domHref = await page.evaluate(async () => {
+    try {
+      const a = Array.from(document.querySelectorAll('a')).reverse().find(x => {
+        const href = x.getAttribute('href') || '';
+        return x.hasAttribute('download') || href.startsWith('blob:') || href.startsWith('data:');
+      });
+      if (!a) return null;
+      const href = a.getAttribute('href') || '';
+      if (href.startsWith('data:')) {
+        const b64 = href.split(',')[1] || '';
+        return { type: 'data', text: atob(b64) };
+      }
+      // blob: — fetch within page context
+      const res = await fetch(href);
+      const text = await res.text();
+      return { type: 'blob', text };
+    } catch (e) {
+      return null;
     }
+  });
+  if (domHref && domHref.text) {
+    fs.writeFileSync(path.join(OUTDIR, CSV_FILENAME), domHref.text, 'utf8');
+    return true;
   }
+
   return false;
 }
 
@@ -193,6 +212,7 @@ async function navigateAndExport(page) {
     await dismissOverlays(page);
     await page.evaluate(() => window.scrollTo(0, 0));
 
+    // A) direct candidates
     for (const t of exportTargets(page)) {
       if (await t.count()) {
         log('click candidate');
@@ -201,7 +221,8 @@ async function navigateAndExport(page) {
       }
     }
 
-    const addBtn = page.getByText(/^\+\s*เพิ่มสินค้า$/).first();
+    // B) toolbar heuristic near "+ เพิ่มสินค้า"
+    const addBtn = page.getByText(/^\\+\\s*เพิ่มสินค้า$/).first();
     if (await addBtn.count()) {
       log('toolbar heuristic');
       const ok = await clickAndCollect(page, async () => {
@@ -218,6 +239,7 @@ async function navigateAndExport(page) {
       if (ok) return true;
     }
 
+    // C) overflow menus
     const menus = [
       'button:has-text("เพิ่มเติม")',
       'button:has-text("More")',
@@ -258,13 +280,13 @@ async function navigateAndExport(page) {
   try {
     const page = await context.newPage();
     const ok = await navigateAndExport(page);
-    if (!ok) throw new Error('ยังไม่พบไฟล์ CSV หลังคลิก "ส่งออก" — อาจเป็น UI ที่สร้างไฟล์ฝั่งหน้าเว็บโดยไม่มี network ตรง');
+    if (!ok) throw new Error('ยังไม่พบไฟล์ CSV หลังคลิก "ส่งออก" — UI อาจสร้างไฟล์จากหน้าเว็บโดยตรง');
     console.log('[ok] Downloaded:', path.join(OUTDIR, CSV_FILENAME));
   } catch (err) {
     console.error('[error]', err.message);
     try {
       const pg = await context.newPage();
-      await pg.goto(URLS_TO_TRY[0], { waitUntil: 'domcontentloaded' }).catch(() => {});
+      await pg.goto('https://r.loyverse.com/dashboard/#/goods/price?page=0&limit=10&inventory=all', { waitUntil: 'domcontentloaded' }).catch(() => {});
       await pg.screenshot({ path: path.join(OUTDIR, SCREENSHOT), fullPage: true }).catch(() => {});
       await pg.close();
       console.error('[error] saved screenshot to out/error.png');
