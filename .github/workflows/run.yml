@@ -1,4 +1,4 @@
-name: Loyverse Export (Items) → Save to Repo
+name: Loyverse Export (Items) — Fast CI
 
 on:
   schedule:
@@ -8,12 +8,19 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: loyverse-export
+  cancel-in-progress: true
+
 jobs:
   export:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     env:
       LOYVERSE_STORAGE_B64: ${{ secrets.LOYVERSE_STORAGE_B64 }}
       HEADLESS: "1"
+      MAX_RUN_MS: "600000" # 10 min hard stop in script
+      DEBUG: "pw:api"      # verbose Playwright logs
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -23,13 +30,15 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Install deps
-        run: |
-          npm i
+      - name: Install dependencies (npm ci)
+        run: npm ci || npm i
+
+      - name: Setup Playwright (browsers & deps)
+        uses: microsoft/playwright-github-action@v1
 
       - name: Run export
-        run: |
-          node export.js
+        timeout-minutes: 10
+        run: node export.js
 
       - name: Upload out/ for debugging
         uses: actions/upload-artifact@v4
@@ -41,6 +50,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Commit CSV to repo
+        if: success()
         run: |
           mkdir -p data
           cp out/inventory.csv data/latest.csv
