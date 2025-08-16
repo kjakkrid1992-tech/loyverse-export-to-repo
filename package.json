@@ -1,11 +1,10 @@
 {
-  "name": "loyverse-export-items-v2",
+  "name": "loyverse-export-items-v2.1-fast",
   "private": true,
   "dependencies": {
     "playwright": "^1.46.0"
   },
   "scripts": {
-    "postinstall": "npx playwright install --with-deps && npx playwright install-deps",
     "export": "node export.js"
   }
 }

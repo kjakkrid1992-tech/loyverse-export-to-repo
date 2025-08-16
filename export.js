@@ -1,4 +1,4 @@
-// export.js — Items-only export
+// export.js — Items-only export with tracing + timeouts
 const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
@@ -6,6 +6,7 @@ const path = require('path');
 const OUTDIR = 'out';
 const CSV_FILENAME = 'inventory.csv';
 const SCREENSHOT = 'error.png';
+const TRACE_ZIP = 'trace.zip';
 const DEFAULT_ITEMS_URL = 'https://r.loyverse.com/dashboard/#/goods/items';
 
 const storagePath = path.join(OUTDIR, 'storage.json');
@@ -23,12 +24,21 @@ function decodeStorageFromEnv() {
   fs.writeFileSync(storagePath, json, 'utf8');
 }
 
+function setGlobalTimeout(ms) {
+  setTimeout(() => {
+    console.error(`HARD TIMEOUT after ${ms}ms — exiting`);
+    process.exit(124);
+  }, ms).unref();
+}
+
 (async () => {
   ensureOutdir();
   decodeStorageFromEnv();
 
   const headless = process.env.HEADLESS === '0' ? false : true;
   const itemsUrl = process.env.LOYVERSE_ITEMS_URL || DEFAULT_ITEMS_URL;
+  const maxRunMs = parseInt(process.env.MAX_RUN_MS || '600000', 10); // 10min hard stop
+  setGlobalTimeout(maxRunMs);
 
   const browser = await chromium.launch({
     headless,
@@ -47,12 +57,21 @@ function decodeStorageFromEnv() {
     context = await tmpBrowser.newContext({ storageState: storagePath });
   }
 
+  // Start tracing
+  await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
+
   try {
     const page = await context.newPage();
 
     console.log('Go to Items page:', itemsUrl);
     await page.goto(itemsUrl, { waitUntil: 'domcontentloaded', timeout: 120000 });
 
+    // Detect login screen early
+    if ((await page.content()).toLowerCase().includes('login')) {
+      console.error('LOGIN_REQUIRED: session may be expired — recapture storage.json');
+    }
+
+    // Wait Export button
     const exportButton = page.getByRole('button', { name: /ส่งออก|Export/i });
     await exportButton.waitFor({ state: 'visible', timeout: 60000 });
 
@@ -112,7 +131,10 @@ function decodeStorageFromEnv() {
     } catch (e) {}
     process.exitCode = 1;
   } finally {
+    // Save trace always
+    try {
+      await context.tracing.stop({ path: path.join(OUTDIR, TRACE_ZIP) });
+    } catch (e) {}
     try { await context.close(); } catch (_) {}
-    try { await (await chromium.launch()).close(); } catch (_) {}
   }
 })();
