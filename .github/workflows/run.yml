@@ -1,9 +1,9 @@
-name: Loyverse Export → Save to Repo
+name: Loyverse Export (Items) → Save to Repo
 
 on:
   schedule:
-    - cron: "0 2 * * *"   # 09:00 (UTC+7) ทุกวัน — GitHub ใช้เวลา UTC
-  workflow_dispatch:
+    - cron: "0 2 * * *"  # 09:00 Asia/Bangkok (UTC+7)
+  workflow_dispatch: {}
 
 permissions:
   contents: write
@@ -11,76 +11,43 @@ permissions:
 jobs:
   export:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
-
+    env:
+      LOYVERSE_STORAGE_B64: ${{ secrets.LOYVERSE_STORAGE_B64 }}
+      HEADLESS: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: "20"
 
-      - name: Ensure package.json & lockfile
+      - name: Install deps
         run: |
-          if [ ! -f package.json ]; then
-            npm init -y
-          fi
-          npm pkg set dependencies.playwright=^1.45.2
-          npm i --package-lock-only
+          npm i
 
-      - name: Cache Playwright browsers
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright-${{ hashFiles('**/package-lock.json') }}
-          restore-keys: ${{ runner.os }}-playwright-
-
-      - name: Install dependencies
-        run: npm ci
-        timeout-minutes: 5
-
-      - name: Install Playwright (Chromium)
-        run: npx playwright install --with-deps chromium
-        timeout-minutes: 8
-
-      - name: Run exporter (Items first)
-        env:
-          LOYVERSE_STORAGE_B64: ${{ secrets.LOYVERSE_STORAGE_B64 }}
-          LOYVERSE_EXPORT_PAGES: "https://r.loyverse.com/dashboard/#/goods/items, https://r.loyverse.com/dashboard/#/inventory_by_items, https://r.loyverse.com/dashboard/#/goods/price?page=0&limit=10&inventory=all"
+      - name: Run export
         run: |
-          mkdir -p out
-          node export.js > out/log.txt 2>&1 || true
-        timeout-minutes: 10
+          node export.js
 
-      - name: Summarize CSV
-        if: always()
-        run: |
-          if [ -f out/inventory.csv ]; then
-            echo "Rows (excl. header): $(( $(wc -l < out/inventory.csv) - 1 ))" | tee -a out/log.txt
-            head -n 2 out/inventory.csv >> out/log.txt || true
-          fi
-
-      - name: Upload debug logs & screenshots
-        if: always()
+      - name: Upload out/ for debugging
         uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: debug
+          name: out-folder
           path: |
-            out/log.txt
-            out/*.png
+            out/*
           if-no-files-found: ignore
 
       - name: Commit CSV to repo
-        if: success()
         run: |
           mkdir -p data
           cp out/inventory.csv data/latest.csv
           ts=$(date -u +%Y-%m-%d_%H-%M-%S)
-          cp out/inventory.csv data/inventory_$ts.csv
+          cp out/inventory.csv data/loyverse_inventory_$ts.csv
           git config user.name "github-actions"
           git config user.email "actions@users.noreply.github.com"
-          git add data/latest.csv data/inventory_*.csv || true
+          git add data/latest.csv data/loyverse_inventory_*.csv
           git commit -m "update: inventory CSV [skip ci]" || echo "no changes"
-          git push || true
+          git push
